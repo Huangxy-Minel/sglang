@@ -160,6 +160,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CLIP_MAX_NEW_TOKENS,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -2287,6 +2288,63 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _estimate_waiting_req_scheduling_tokens(self, req: Req) -> int:
+        remaining_input = max(
+            len(req.origin_input_ids) + len(req.output_ids) - len(req.prefix_indices),
+            0,
+        )
+        remaining_output = min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        return remaining_input + remaining_output
+
+    def _maybe_clear_hisparse_stale_batch_full(self):
+        if (
+            not self.enable_hisparse
+            or not self.running_batch.batch_is_full
+            or self.chunked_req is not None
+            or len(self.waiting_queue) == 0
+        ):
+            return
+
+        running_bs = len(self.running_batch.reqs)
+        if self.get_num_allocatable_reqs(running_bs) <= 0:
+            return
+
+        if (
+            getattr(
+                type(self.token_to_kv_pool_allocator),
+                "scheduling_available_size",
+                None,
+            )
+            is None
+        ):
+            return
+
+        required_tokens = self._estimate_waiting_req_scheduling_tokens(
+            self.waiting_queue[0]
+        )
+        scheduling_available = (
+            self.token_to_kv_pool_allocator.scheduling_available_size(
+                self.tree_cache.evictable_size()
+            )
+        )
+        if scheduling_available <= required_tokens:
+            return
+
+        self.running_batch.batch_is_full = False
+        if os.getenv("SGLANG_HISPARSE_CAPACITY_LOG") == "1":
+            logger.info(
+                "HiSparse clears stale batch_is_full: "
+                "scheduling_available=%d, required_next_waiting=%d, "
+                "running_bs=%d, queue_req=%d",
+                scheduling_available,
+                required_tokens,
+                running_bs,
+                len(self.waiting_queue),
+            )
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2336,6 +2394,8 @@ class Scheduler(
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
+
+        self._maybe_clear_hisparse_stale_batch_full()
 
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -3079,6 +3139,12 @@ class Scheduler(
         hisparse_coordinator = getattr(self, "hisparse_coordinator", None)
         if self.enable_hisparse and hisparse_coordinator is not None:
             ret["hisparse_capacity"] = hisparse_coordinator.capacity_stats()
+            ret["hisparse_scheduler"] = {
+                "running_batch_is_full": bool(self.running_batch.batch_is_full),
+                "chunked_req": self.chunked_req is not None,
+                "running_batch_size": len(self.running_batch.reqs),
+                "waiting_queue_size": len(self.waiting_queue),
+            }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
