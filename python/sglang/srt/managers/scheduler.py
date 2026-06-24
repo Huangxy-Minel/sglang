@@ -859,6 +859,8 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self.hisparse_stale_batch_full_clear_count = 0
+        self.hisparse_stale_batch_full_last_log_time = 0.0
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2334,15 +2336,22 @@ class Scheduler(
             return
 
         self.running_batch.batch_is_full = False
-        if os.getenv("SGLANG_HISPARSE_CAPACITY_LOG") == "1":
+        self.hisparse_stale_batch_full_clear_count += 1
+        now = time.monotonic()
+        if (
+            os.getenv("SGLANG_HISPARSE_CAPACITY_LOG") == "1"
+            and now - self.hisparse_stale_batch_full_last_log_time >= 5.0
+        ):
+            self.hisparse_stale_batch_full_last_log_time = now
             logger.info(
                 "HiSparse clears stale batch_is_full: "
                 "scheduling_available=%d, required_next_waiting=%d, "
-                "running_bs=%d, queue_req=%d",
+                "running_bs=%d, queue_req=%d, clear_count=%d",
                 scheduling_available,
                 required_tokens,
                 running_bs,
                 len(self.waiting_queue),
+                self.hisparse_stale_batch_full_clear_count,
             )
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -3144,6 +3153,9 @@ class Scheduler(
                 "chunked_req": self.chunked_req is not None,
                 "running_batch_size": len(self.running_batch.reqs),
                 "waiting_queue_size": len(self.waiting_queue),
+                "stale_batch_full_clear_count": (
+                    self.hisparse_stale_batch_full_clear_count
+                ),
             }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
