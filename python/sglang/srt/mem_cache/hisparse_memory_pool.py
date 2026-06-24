@@ -172,6 +172,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.host_pool = None
         self.clear()
 
         self._kvcache.register_mapping(
@@ -187,6 +188,60 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
         )
+
+    def attach_host_pool(self, host_pool):
+        self.host_pool = host_pool
+
+    def logical_available_size(self) -> int:
+        return self.logical_attn_allocator.available_size()
+
+    def hot_available_size(self) -> int:
+        return self.hisparse_attn_allocator.available_size()
+
+    def host_available_size(self) -> int:
+        if self.host_pool is None:
+            return self.logical_available_size()
+        return self.host_pool.available_size()
+
+    def scheduling_available_size(self, evictable_size: int = 0) -> int:
+        logical_available = self.logical_available_size() + evictable_size
+        return min(logical_available, self.host_available_size())
+
+    @staticmethod
+    def _capacity_stats(total: int, available: int) -> dict:
+        used = max(total - available, 0)
+        return {
+            "used": used,
+            "available": available,
+            "total": total,
+            "usage": used / total if total > 0 else 0.0,
+        }
+
+    def capacity_stats(self) -> dict:
+        logical_total = self.logical_attn_allocator.size
+        logical_available = self.logical_available_size()
+        hot_total = self.hisparse_attn_allocator.size
+        hot_available = self.hot_available_size()
+
+        if self.host_pool is None:
+            host_total = logical_total
+            host_available = logical_available
+            host_bytes = 0
+        else:
+            host_total = self.host_pool.size
+            host_available = self.host_pool.available_size()
+            host_bytes = host_total * self.host_pool.size_per_token
+
+        host_stats = self._capacity_stats(host_total, host_available)
+        host_stats["bytes"] = host_bytes
+
+        return {
+            "hot": self._capacity_stats(hot_total, hot_available),
+            "logical": self._capacity_stats(logical_total, logical_available),
+            "host": host_stats,
+            "effective_available": self.available_size(),
+            "scheduling_available": self.scheduling_available_size(),
+        }
 
     def alloc(self, need_size: int):
         raise NotImplementedError(

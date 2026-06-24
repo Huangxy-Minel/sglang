@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+HISPARSE_CAPACITY_LOG = get_bool_env_var("SGLANG_HISPARSE_CAPACITY_LOG")
 
 
 @dataclasses.dataclass
@@ -55,6 +56,10 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    no_token_reject_count: int = 0
+    last_no_token_total_tokens: Optional[int] = None
+    last_no_token_rem_total_tokens: Optional[int] = None
+    last_no_token_effective_available: Optional[int] = None
 
     @classmethod
     def from_adder(
@@ -71,6 +76,12 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
+            no_token_reject_count=adder.no_token_reject_count,
+            last_no_token_total_tokens=adder.last_no_token_total_tokens,
+            last_no_token_rem_total_tokens=adder.last_no_token_rem_total_tokens,
+            last_no_token_effective_available=(
+                adder.last_no_token_effective_available
+            ),
         )
 
 
@@ -176,6 +187,31 @@ class SchedulerMetricsMixin:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
             )
+
+    def _format_hisparse_capacity_log(self: Scheduler) -> str:
+        if not HISPARSE_CAPACITY_LOG or not getattr(self, "enable_hisparse", False):
+            return ""
+
+        coordinator = getattr(self, "hisparse_coordinator", None)
+        if coordinator is None:
+            return ""
+
+        stats = coordinator.capacity_stats()
+
+        def fmt_pool(name: str) -> str:
+            pool = stats[name]
+            return (
+                f"hisparse {name}: {pool['used']}/{pool['total']} "
+                f"({pool['usage']:.2f})"
+            )
+
+        return (
+            f", {fmt_pool('hot')}, {fmt_pool('logical')}, {fmt_pool('host')}, "
+            f"hisparse effective available: {stats['effective_available']}, "
+            f"hisparse scheduling available: {stats['scheduling_available']}, "
+            f"host_to_device_ratio: {stats['host_to_device_ratio']}, "
+            f"hisparse staging queue: {stats['staging_queue_len']}"
+        )
 
     def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
@@ -414,6 +450,17 @@ class SchedulerMetricsMixin:
 
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
+        msg += self._format_hisparse_capacity_log()
+
+        if HISPARSE_CAPACITY_LOG and prefill_stats.no_token_reject_count:
+            msg += (
+                f", no-token rejects: {prefill_stats.no_token_reject_count}, "
+                f"last no-token total: {prefill_stats.last_no_token_total_tokens}, "
+                f"last no-token rem-total: "
+                f"{prefill_stats.last_no_token_rem_total_tokens}, "
+                f"last no-token effective available: "
+                f"{prefill_stats.last_no_token_effective_available}"
+            )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
@@ -656,6 +703,7 @@ class SchedulerMetricsMixin:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+        msg += self._format_hisparse_capacity_log()
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency

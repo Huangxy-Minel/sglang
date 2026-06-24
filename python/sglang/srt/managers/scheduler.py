@@ -3076,6 +3076,9 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        hisparse_coordinator = getattr(self, "hisparse_coordinator", None)
+        if self.enable_hisparse and hisparse_coordinator is not None:
+            ret["hisparse_capacity"] = hisparse_coordinator.capacity_stats()
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:

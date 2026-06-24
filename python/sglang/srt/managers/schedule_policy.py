@@ -414,6 +414,10 @@ class PrefillAdder:
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
+        self.no_token_reject_count = 0
+        self.last_no_token_total_tokens = None
+        self.last_no_token_rem_total_tokens = None
+        self.last_no_token_effective_available = None
 
         if running_batch is not None:
             self.rem_total_token_offset += sum(
@@ -468,11 +472,31 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
+            available_and_evictable = self._scheduling_available_size()
         return available_and_evictable - self.rem_total_token_offset
+
+    def _scheduling_available_size(self):
+        if (
+            getattr(
+                type(self.token_to_kv_pool_allocator),
+                "scheduling_available_size",
+                None,
+            )
+            is not None
+        ):
+            return self.token_to_kv_pool_allocator.scheduling_available_size(
+                self.tree_cache.evictable_size()
+            )
+        return (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
+        )
+
+    def _record_no_token_reject(self, total_tokens: int, rem_total_tokens: int):
+        self.no_token_reject_count += 1
+        self.last_no_token_total_tokens = total_tokens
+        self.last_no_token_rem_total_tokens = rem_total_tokens
+        self.last_no_token_effective_available = self._scheduling_available_size()
 
     @property
     def cur_rem_tokens(self):
@@ -761,7 +785,9 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
+        rem_total_tokens = self.rem_total_tokens
+        if total_tokens >= rem_total_tokens:
+            self._record_no_token_reject(total_tokens, rem_total_tokens)
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
@@ -769,7 +795,9 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            rem_total_tokens = self.rem_total_tokens
+            if total_tokens >= rem_total_tokens:
+                self._record_no_token_reject(total_tokens, rem_total_tokens)
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:

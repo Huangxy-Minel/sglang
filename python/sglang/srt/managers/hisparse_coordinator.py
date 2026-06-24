@@ -43,6 +43,7 @@ class HiSparseCoordinator:
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
+        self.host_to_device_ratio = host_to_device_ratio
 
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
@@ -55,6 +56,7 @@ class HiSparseCoordinator:
             layout="layer_first",
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
         )
+        self.token_to_kv_pool_allocator.attach_host_pool(self.mem_pool_host)
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -121,6 +123,18 @@ class HiSparseCoordinator:
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
+
+    def capacity_stats(self) -> dict:
+        stats = self.token_to_kv_pool_allocator.capacity_stats()
+        stats.update(
+            {
+                "host_to_device_ratio": self.host_to_device_ratio,
+                "top_k": self.top_k,
+                "device_buffer_size": self.device_buffer_size,
+                "staging_queue_len": len(self.ack_staging_queue),
+            }
+        )
+        return stats
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
