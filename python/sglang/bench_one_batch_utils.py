@@ -20,6 +20,33 @@ class ChunkPlan:
     bounds: tuple[tuple[int, int], ...]
 
 
+@dataclass(frozen=True)
+class HiSparseCapacitySnapshot:
+    hot_total: int
+    hot_available: int
+    logical_total: int
+    logical_available: int
+    host_total: int
+    host_available: int
+    request_slots_available: int
+    max_context_len: int
+
+
+@dataclass(frozen=True)
+class HiSparseCapacityRequirements:
+    hot_per_ready_request: int
+    hot_prefill_peak: int
+    logical_for_next_wave: int
+    host_for_next_wave: int
+
+
+@dataclass(frozen=True)
+class HiSparseAdmissionDecision:
+    can_admit: bool
+    stop_reason: str
+    requirements: HiSparseCapacityRequirements
+
+
 def build_deepep_micro_warmup_shape(
     moe_a2a_backend: str,
     deepep_mode: str,
@@ -127,6 +154,107 @@ def build_chunk_plan(
     )
 
 
+def build_hisparse_wave_chunk_plan(
+    input_len: int,
+    requested_chunk_size: Optional[int],
+    effective_chunk_size: Optional[int],
+    page_size: int,
+) -> ChunkPlan:
+    """Build the chunk plan for one request in each attention DP group."""
+    return build_chunk_plan(
+        input_lengths=[input_len],
+        requested_chunk_size=requested_chunk_size,
+        effective_chunk_size=effective_chunk_size,
+        page_size=page_size,
+    )
+
+
+def global_requested_batch_size(batch_size: int, dp_size: int) -> int:
+    if batch_size <= 0 or dp_size <= 0:
+        raise ValueError("batch_size and dp_size must be positive")
+    return batch_size * dp_size
+
+
+def seed_for_attention_dp_group(random_seed: int, attention_dp_rank: int) -> int:
+    if attention_dp_rank < 0:
+        raise ValueError("attention_dp_rank must be non-negative")
+    return random_seed + attention_dp_rank
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def evaluate_hisparse_wave_admission(
+    snapshot: HiSparseCapacitySnapshot,
+    ready_count: int,
+    requested_batch_size: int,
+    input_len: int,
+    output_len: int,
+    page_size: int,
+    device_buffer_size: int,
+) -> HiSparseAdmissionDecision:
+    """Check whether one more request per attention DP group can be prefetched.
+
+    Allocator free counts only describe allocations made so far. This check also
+    reserves the future decode growth of requests that have already completed
+    prefill, so a large requested decode batch cannot overcommit the hot pool.
+    """
+    if ready_count < 0:
+        raise ValueError("ready_count must be non-negative")
+    if requested_batch_size <= 0:
+        raise ValueError("requested_batch_size must be positive")
+    if input_len <= 0 or output_len <= 0:
+        raise ValueError("input_len and output_len must be positive")
+    if page_size <= 0 or device_buffer_size <= 0:
+        raise ValueError("page_size and device_buffer_size must be positive")
+
+    full_len = input_len + output_len
+    aligned_input_len = _align_up(input_len, page_size)
+    aligned_full_len = _align_up(full_len, page_size)
+    next_request_logical_peak = max(
+        aligned_full_len,
+        input_len + page_size,
+    )
+    hot_per_ready_request = min(aligned_full_len, device_buffer_size)
+    if hot_per_ready_request == device_buffer_size:
+        hot_per_ready_request += page_size
+
+    requirements = HiSparseCapacityRequirements(
+        hot_per_ready_request=hot_per_ready_request,
+        hot_prefill_peak=input_len + page_size,
+        logical_for_next_wave=(
+            ready_count * (aligned_full_len - aligned_input_len)
+            + next_request_logical_peak
+        ),
+        host_for_next_wave=ready_count * output_len + full_len,
+    )
+
+    def decision(can_admit: bool, reason: str) -> HiSparseAdmissionDecision:
+        return HiSparseAdmissionDecision(can_admit, reason, requirements)
+
+    if ready_count >= requested_batch_size:
+        return decision(False, "target_reached")
+    if full_len > snapshot.max_context_len:
+        return decision(False, "max_context_len")
+    if snapshot.request_slots_available < 1:
+        return decision(False, "request_pool")
+
+    virtual_hot_available = min(
+        snapshot.hot_available,
+        snapshot.hot_total - ready_count * hot_per_ready_request,
+    )
+    if virtual_hot_available < requirements.hot_prefill_peak:
+        return decision(False, "hot_prefill_peak")
+    if snapshot.hot_total < (ready_count + 1) * hot_per_ready_request:
+        return decision(False, "hot_decode_reserve")
+    if snapshot.logical_available < requirements.logical_for_next_wave:
+        return decision(False, "logical_pool")
+    if snapshot.host_available < requirements.host_for_next_wave:
+        return decision(False, "host_pool")
+    return decision(True, "admitted")
+
+
 def prepare_chunk_requests(
     reqs,
     full_input_ids: Sequence[Sequence[int]],
@@ -145,6 +273,18 @@ def prepare_chunk_requests(
         req.set_extend_input_len(end - start)
 
 
+def values_from_slowest_rank(
+    per_rank_values: Sequence[Sequence[float]],
+) -> tuple[float, ...]:
+    """Return the complete metric row whose first value is largest."""
+    if not per_rank_values or not per_rank_values[0]:
+        raise ValueError("per_rank_values must contain non-empty rows")
+    width = len(per_rank_values[0])
+    if any(len(values) != width for values in per_rank_values):
+        raise ValueError("all per-rank metric rows must have the same width")
+    return tuple(max(per_rank_values, key=lambda values: values[0]))
+
+
 def build_cluster_metrics(
     batch_size: int,
     dp_size: int,
@@ -153,6 +293,7 @@ def build_cluster_metrics(
     cluster_prefill_latency: float,
     cluster_median_decode_latency: Optional[float],
     cluster_total_latency: float,
+    requested_batch_size: Optional[int] = None,
 ) -> dict[str, float | int]:
     """Calculate metrics from latencies already max-reduced across ranks."""
     if cluster_prefill_latency <= 0:
@@ -165,8 +306,14 @@ def build_cluster_metrics(
     ):
         raise ValueError("cluster_median_decode_latency must be positive")
 
+    requested_batch_size = requested_batch_size or batch_size
     global_batch_size = batch_size * dp_size
     result: dict[str, float | int] = {
+        "requested_batch_size": requested_batch_size,
+        "batch_size": batch_size,
+        "requested_global_batch_size": global_requested_batch_size(
+            requested_batch_size, dp_size
+        ),
         "global_batch_size": global_batch_size,
         "cluster_prefill_latency": cluster_prefill_latency,
         "cluster_prefill_throughput": (

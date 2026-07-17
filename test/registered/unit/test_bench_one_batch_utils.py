@@ -195,6 +195,16 @@ class TestDeepEPMicroWarmup(unittest.TestCase):
 
 
 class TestClusterMetrics(unittest.TestCase):
+    def test_phase_breakdown_comes_from_the_slowest_prefill_rank(self):
+        values = bench_utils.values_from_slowest_rank(
+            [
+                (5.0, 3.0, 1.0, 1.0),
+                (6.0, 2.0, 3.0, 1.0),
+                (4.0, 2.0, 1.0, 1.0),
+            ]
+        )
+        self.assertEqual(values, (6.0, 2.0, 3.0, 1.0))
+
     def test_metrics_use_global_batch_and_slowest_rank_latencies(self):
         metrics = bench_utils.build_cluster_metrics(
             batch_size=32,
@@ -214,6 +224,161 @@ class TestClusterMetrics(unittest.TestCase):
         self.assertAlmostEqual(
             metrics["cluster_overall_throughput"],
             (4096 + 3) * 512 / 5.25,
+        )
+
+    def test_metrics_distinguish_requested_and_admitted_decode_batch(self):
+        metrics = bench_utils.build_cluster_metrics(
+            batch_size=21,
+            requested_batch_size=128,
+            dp_size=16,
+            input_len=4096,
+            output_len=128,
+            cluster_prefill_latency=8.0,
+            cluster_median_decode_latency=0.1,
+            cluster_total_latency=9.0,
+        )
+        self.assertEqual(metrics["requested_batch_size"], 128)
+        self.assertEqual(metrics["batch_size"], 21)
+        self.assertEqual(metrics["requested_global_batch_size"], 2048)
+        self.assertEqual(metrics["global_batch_size"], 336)
+
+
+class TestHiSparseWaveCapacity(unittest.TestCase):
+    def _snapshot(self, **overrides):
+        values = dict(
+            hot_total=20000,
+            hot_available=20000,
+            logical_total=200000,
+            logical_available=200000,
+            host_total=200000,
+            host_available=200000,
+            request_slots_available=128,
+            max_context_len=32768,
+        )
+        values.update(overrides)
+        return bench_utils.HiSparseCapacitySnapshot(**values)
+
+    def test_wave_chunk_budget_is_per_dp_group_request(self):
+        dp16 = bench_utils.build_hisparse_wave_chunk_plan(
+            input_len=32768,
+            requested_chunk_size=65536,
+            effective_chunk_size=4096,
+            page_size=64,
+        )
+        dp8 = bench_utils.build_hisparse_wave_chunk_plan(
+            input_len=32768,
+            requested_chunk_size=65536,
+            effective_chunk_size=8192,
+            page_size=64,
+        )
+        self.assertEqual(dp16.per_request_chunk_size, 4096)
+        self.assertEqual(dp16.num_chunks, 8)
+        self.assertEqual(dp8.per_request_chunk_size, 8192)
+        self.assertEqual(dp8.num_chunks, 4)
+
+    def test_capacity_reserves_prefill_peak_and_future_decode(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(),
+            ready_count=1,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            device_buffer_size=4096,
+        )
+        self.assertTrue(decision.can_admit)
+        self.assertEqual(decision.stop_reason, "admitted")
+        self.assertEqual(decision.requirements.hot_per_ready_request, 4160)
+        self.assertEqual(decision.requirements.hot_prefill_peak, 4160)
+        self.assertEqual(decision.requirements.logical_for_next_wave, 4352)
+        self.assertEqual(decision.requirements.host_for_next_wave, 4352)
+
+    def test_hot_prefill_peak_stops_before_launching_partial_wave(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(hot_total=8256, hot_available=4096),
+            ready_count=1,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            device_buffer_size=4096,
+        )
+        self.assertFalse(decision.can_admit)
+        self.assertEqual(decision.stop_reason, "hot_prefill_peak")
+
+    def test_hot_decode_reserve_is_checked_even_if_current_pool_is_free(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(hot_total=8256, hot_available=8192),
+            ready_count=1,
+            requested_batch_size=4,
+            input_len=1024,
+            output_len=4096,
+            page_size=64,
+            device_buffer_size=4096,
+        )
+        self.assertFalse(decision.can_admit)
+        self.assertEqual(decision.stop_reason, "hot_decode_reserve")
+
+    def test_logical_host_request_and_context_failures_are_distinct(self):
+        common = dict(
+            ready_count=1,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            device_buffer_size=4096,
+        )
+        cases = [
+            (self._snapshot(logical_available=4000), "logical_pool"),
+            (self._snapshot(host_available=4000), "host_pool"),
+            (self._snapshot(request_slots_available=0), "request_pool"),
+            (self._snapshot(max_context_len=4095), "max_context_len"),
+        ]
+        for snapshot, expected in cases:
+            with self.subTest(expected=expected):
+                decision = bench_utils.evaluate_hisparse_wave_admission(
+                    snapshot=snapshot, **common
+                )
+                self.assertFalse(decision.can_admit)
+                self.assertEqual(decision.stop_reason, expected)
+
+    def test_logical_capacity_includes_extend_safety_page(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(logical_available=1024),
+            ready_count=0,
+            requested_batch_size=1,
+            input_len=1000,
+            output_len=1,
+            page_size=64,
+            device_buffer_size=4096,
+        )
+        self.assertFalse(decision.can_admit)
+        self.assertEqual(decision.stop_reason, "logical_pool")
+        self.assertEqual(decision.requirements.logical_for_next_wave, 1064)
+
+    def test_requested_batch_is_a_per_dp_group_target(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(),
+            ready_count=128,
+            requested_batch_size=128,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            device_buffer_size=4096,
+        )
+        self.assertFalse(decision.can_admit)
+        self.assertEqual(decision.stop_reason, "target_reached")
+        self.assertEqual(bench_utils.global_requested_batch_size(128, 16), 2048)
+        self.assertEqual(bench_utils.global_requested_batch_size(128, 8), 1024)
+
+    def test_dp_seed_is_shared_by_tp_ranks_but_changes_across_dp_groups(self):
+        self.assertEqual(
+            bench_utils.seed_for_attention_dp_group(1234, 7),
+            bench_utils.seed_for_attention_dp_group(1234, 7),
+        )
+        self.assertNotEqual(
+            bench_utils.seed_for_attention_dp_group(1234, 7),
+            bench_utils.seed_for_attention_dp_group(1234, 8),
         )
 
 
