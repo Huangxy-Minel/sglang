@@ -20,6 +20,21 @@ class ChunkPlan:
     bounds: tuple[tuple[int, int], ...]
 
 
+def build_deepep_micro_warmup_shape(
+    moe_a2a_backend: str,
+    deepep_mode: str,
+    page_size: int,
+) -> Optional[tuple[int, int, int]]:
+    """Return a small prefill-only shape for initializing normal DeepEP."""
+    if moe_a2a_backend != "deepep" or deepep_mode not in ("auto", "normal"):
+        return None
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+
+    input_len = ((max(64, page_size) + page_size - 1) // page_size) * page_size
+    return 1, input_len, 1
+
+
 def get_local_rank_assignments(
     tp_size: int, nnodes: int, node_rank: int
 ) -> list[tuple[int, int]]:

@@ -68,6 +68,7 @@ from sglang.bench_one_batch_utils import (
     ChunkPlan,
     build_chunk_plan,
     build_cluster_metrics,
+    build_deepep_micro_warmup_shape,
     get_local_rank_assignments,
     prepare_chunk_requests,
 )
@@ -1010,6 +1011,46 @@ def latency_test(
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
+
+    micro_warmup_shape = build_deepep_micro_warmup_shape(
+        moe_a2a_backend=server_args.moe_a2a_backend,
+        deepep_mode=server_args.deepep_mode,
+        page_size=model_runner.page_size,
+    )
+    if micro_warmup_shape is not None:
+        micro_batch_size, micro_input_len, micro_output_len = micro_warmup_shape
+        micro_reqs = prepare_synthetic_inputs_for_latency_test(
+            micro_batch_size,
+            micro_input_len,
+            custom_inputs=[list(range(micro_input_len))],
+        )
+        micro_chunk_plan = build_chunk_plan(
+            input_lengths=[micro_input_len] * micro_batch_size,
+            requested_chunk_size=None,
+            effective_chunk_size=server_args.chunked_prefill_size,
+            page_size=model_runner.page_size,
+        )
+        rank_print(
+            "DeepEP normal micro warmup (unmeasured). "
+            f"batch_size={micro_batch_size}, input_len={micro_input_len}, "
+            f"output_len={micro_output_len}"
+        )
+        model_runner.clear()
+        model_runner.synchronize()
+        micro_tic = time.perf_counter()
+        model_runner.prefill(
+            micro_reqs,
+            chunk_plan=micro_chunk_plan,
+            trace_enabled=False,
+        )
+        model_runner.synchronize()
+        rank_print(
+            "DeepEP normal micro warmup finished. "
+            f"latency={time.perf_counter() - micro_tic:6.5f} s"
+        )
+        # Keep synchronization outside the measured target warmup/benchmark.
+        model_runner.barrier()
+        model_runner.clear()
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(

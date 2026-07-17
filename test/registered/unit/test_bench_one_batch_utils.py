@@ -148,6 +148,52 @@ class TestChunkPlan(unittest.TestCase):
         self.assertEqual(req.extend_input_len, 128)
 
 
+class TestDeepEPMicroWarmup(unittest.TestCase):
+    def test_auto_and_normal_modes_get_page_aligned_prefill_only_shape(self):
+        self.assertEqual(
+            bench_utils.build_deepep_micro_warmup_shape(
+                moe_a2a_backend="deepep",
+                deepep_mode="auto",
+                page_size=64,
+            ),
+            (1, 64, 1),
+        )
+        self.assertEqual(
+            bench_utils.build_deepep_micro_warmup_shape(
+                moe_a2a_backend="deepep",
+                deepep_mode="normal",
+                page_size=128,
+            ),
+            (1, 128, 1),
+        )
+
+    def test_micro_warmup_is_disabled_without_normal_deepep(self):
+        self.assertIsNone(
+            bench_utils.build_deepep_micro_warmup_shape(
+                moe_a2a_backend="deepep",
+                deepep_mode="low_latency",
+                page_size=64,
+            )
+        )
+        self.assertIsNone(
+            bench_utils.build_deepep_micro_warmup_shape(
+                moe_a2a_backend="none",
+                deepep_mode="auto",
+                page_size=64,
+            )
+        )
+
+    def test_micro_input_has_at_least_64_tokens_and_is_page_aligned(self):
+        self.assertEqual(
+            bench_utils.build_deepep_micro_warmup_shape(
+                moe_a2a_backend="deepep",
+                deepep_mode="auto",
+                page_size=24,
+            ),
+            (1, 72, 1),
+        )
+
+
 class TestClusterMetrics(unittest.TestCase):
     def test_metrics_use_global_batch_and_slowest_rank_latencies(self):
         metrics = bench_utils.build_cluster_metrics(
