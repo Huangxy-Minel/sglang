@@ -68,7 +68,6 @@ from sglang.bench_one_batch_utils import (
     ChunkPlan,
     build_chunk_plan,
     build_cluster_metrics,
-    enable_deepep_precompile_barriers_for_warmup,
     get_local_rank_assignments,
     prepare_chunk_requests,
 )
@@ -79,7 +78,6 @@ from sglang.srt.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -1020,30 +1018,26 @@ def latency_test(
 
     # Warm up
     rank_print("Warmup ...")
-    with enable_deepep_precompile_barriers_for_warmup(
-        envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE
-    ):
-        latency_test_run_once(
-            bench_args.run_name,
-            model_runner,
-            server_args,
-            rank_print,
-            reqs,
-            bench_args.batch_size[0],
-            bench_args.input_len[0],
-            min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
-            log_decode_step=0,
-            profile=False,
-            profile_record_shapes=False,
-            profile_activities=("CPU", "GPU"),
-            profile_filename_prefix="",
-            profile_stage="all",
-            tp_rank=tp_rank,
-            profile_start_step=None,
-            profile_steps=None,
-            requested_chunked_prefill_size=bench_args.chunked_prefill_size,
-        )
-        model_runner.barrier()
+    latency_test_run_once(
+        bench_args.run_name,
+        model_runner,
+        server_args,
+        rank_print,
+        reqs,
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
+        log_decode_step=0,
+        profile=False,
+        profile_record_shapes=False,
+        profile_activities=("CPU", "GPU"),
+        profile_filename_prefix="",
+        profile_stage="all",
+        tp_rank=tp_rank,
+        profile_start_step=None,
+        profile_steps=None,
+        requested_chunked_prefill_size=bench_args.chunked_prefill_size,
+    )
 
     rank_print("Benchmark ...")
 
