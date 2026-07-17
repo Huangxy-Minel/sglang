@@ -105,8 +105,15 @@ class TestChunkPlan(unittest.TestCase):
 
     def test_prepare_chunk_reuses_request_slot_and_committed_prefix(self):
         class CloneableList(list):
+            def __init__(self, values=(), dtype="int32"):
+                super().__init__(values)
+                self.dtype = dtype
+
             def clone(self):
-                return CloneableList(self)
+                return CloneableList(self, dtype=self.dtype)
+
+            def long(self):
+                return CloneableList(self, dtype="int64")
 
         class FakeReqToToken:
             def __init__(self):
@@ -136,6 +143,7 @@ class TestChunkPlan(unittest.TestCase):
         )
         self.assertEqual(req.req_pool_idx, 0)
         self.assertEqual(req.prefix_indices, list(range(128)))
+        self.assertEqual(req.prefix_indices.dtype, "int64")
         self.assertEqual(req.fill_ids, list(range(256)))
         self.assertEqual(req.extend_input_len, 128)
 

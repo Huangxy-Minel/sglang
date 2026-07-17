@@ -122,7 +122,10 @@ def prepare_chunk_requests(
     """Advance static requests to one chunk while preserving their pool slots."""
     for req, input_ids in zip(reqs, full_input_ids):
         if start > 0:
-            req.prefix_indices = req_to_token[req.req_pool_idx, :start].clone()
+            # write_cache_indices reads prefix tensor pointers as int64.
+            req.prefix_indices = (
+                req_to_token[req.req_pool_idx, :start].clone().long()
+            )
         req.fill_ids = list(input_ids[:end])
         req.set_extend_input_len(end - start)
 
