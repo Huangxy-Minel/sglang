@@ -171,5 +171,54 @@ class TestClusterMetrics(unittest.TestCase):
         )
 
 
+class TestWarmupPrecompileBarriers(unittest.TestCase):
+    def test_barriers_are_enabled_only_inside_warmup_scope(self):
+        class FakeFlag:
+            def __init__(self):
+                self.value = False
+
+            def override(self, value):
+                flag = self
+
+                class Override:
+                    def __enter__(self):
+                        self.original = flag.value
+                        flag.value = value
+
+                    def __exit__(self, exc_type, exc_value, traceback):
+                        flag.value = self.original
+
+                return Override()
+
+        flag = FakeFlag()
+        self.assertFalse(flag.value)
+        with bench_utils.enable_deepep_precompile_barriers_for_warmup(flag):
+            self.assertTrue(flag.value)
+        self.assertFalse(flag.value)
+
+    def test_barrier_flag_is_restored_when_warmup_fails(self):
+        class FakeFlag:
+            value = False
+
+            def override(self, value):
+                flag = self
+
+                class Override:
+                    def __enter__(self):
+                        flag.value = value
+
+                    def __exit__(self, exc_type, exc_value, traceback):
+                        flag.value = False
+
+                return Override()
+
+        flag = FakeFlag()
+        with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+            with bench_utils.enable_deepep_precompile_barriers_for_warmup(flag):
+                self.assertTrue(flag.value)
+                raise RuntimeError("warmup failed")
+        self.assertFalse(flag.value)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ chunk, and metric calculations can be unit tested on CPU-only machines.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -18,6 +19,13 @@ class ChunkPlan:
     per_request_chunk_size: int
     num_chunks: int
     bounds: tuple[tuple[int, int], ...]
+
+
+@contextmanager
+def enable_deepep_precompile_barriers_for_warmup(precompile_stage_flag):
+    """Enable DeepEP rank synchronization only for one-batch warmup."""
+    with precompile_stage_flag.override(True):
+        yield
 
 
 def get_local_rank_assignments(
