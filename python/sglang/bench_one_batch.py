@@ -56,6 +56,7 @@ import logging
 import multiprocessing
 import os
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -63,8 +64,19 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.bench_one_batch_utils import (
+    ChunkPlan,
+    build_chunk_plan,
+    build_cluster_metrics,
+    get_local_rank_assignments,
+    prepare_chunk_requests,
+)
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import destroy_distributed_environment
+from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    get_tp_group,
+)
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
@@ -156,6 +168,29 @@ def stop_profile(
             rank_print(f"CUDA profiler trace for {stage} completed")
 
 
+@contextmanager
+def trace_range(name: str, enabled: bool):
+    """Emit matching torch-profiler and NVTX ranges when profiling is enabled."""
+    if not enabled:
+        yield
+        return
+
+    use_nvtx = torch.cuda.is_available()
+    if use_nvtx:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        with torch.profiler.record_function(name):
+            yield
+    finally:
+        if use_nvtx:
+            torch.cuda.nvtx.range_pop()
+
+
+def trace_mark(name: str, enabled: bool):
+    if enabled and torch.cuda.is_available():
+        torch.cuda.nvtx.mark(name)
+
+
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
@@ -175,6 +210,9 @@ class BenchArgs:
     profile_filename_prefix: str = "profile"
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
+    # This option is registered by ServerArgs. Keeping the raw CLI value here
+    # lets one-batch distinguish an explicit request from an automatic default.
+    chunked_prefill_size: Optional[int] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -411,7 +449,7 @@ class TreeCacheNamespace(SimpleNamespace):
 
 
 @torch.no_grad
-def extend(reqs, model_runner):
+def extend(reqs, model_runner, sample: bool = True):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
     dummy_tree_cache = TreeCacheNamespace(
         page_size=model_runner.server_args.page_size,
@@ -429,11 +467,14 @@ def extend(reqs, model_runner):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
+    batch.is_extend_in_batch = True
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    next_token_ids = (
+        model_runner.sample(logits_output, forward_batch) if sample else None
+    )
     return next_token_ids, logits_output.next_token_logits, batch
 
 
@@ -441,6 +482,7 @@ def extend(reqs, model_runner):
 def decode(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
+    batch.is_extend_in_batch = False
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
@@ -475,8 +517,31 @@ class _TorchBenchRunner:
         self.torch_runner.req_to_token_pool.clear()
         self.torch_runner.token_to_kv_pool_allocator.clear()
 
-    def extend(self, reqs):
-        return extend(reqs, self.torch_runner)
+    def extend(self, reqs, sample: bool = True):
+        return extend(reqs, self.torch_runner, sample=sample)
+
+    def prefill(self, reqs, chunk_plan: ChunkPlan, trace_enabled: bool):
+        if not chunk_plan.enabled:
+            with trace_range("prefill/chunk_0", trace_enabled):
+                return self.extend(reqs)
+
+        full_input_ids = [list(req.fill_ids) for req in reqs]
+        result = None
+        for chunk_index, (start, end) in enumerate(chunk_plan.bounds):
+            prepare_chunk_requests(
+                reqs=reqs,
+                full_input_ids=full_input_ids,
+                start=start,
+                end=end,
+                req_to_token=self.torch_runner.req_to_token_pool.req_to_token,
+            )
+
+            is_final_chunk = chunk_index == chunk_plan.num_chunks - 1
+            with trace_range(f"prefill/chunk_{chunk_index}", trace_enabled):
+                result = self.extend(reqs, sample=is_final_chunk)
+
+        assert result is not None and result[0] is not None
+        return result
 
     def decode(self, next_token_ids, batch):
         return decode(next_token_ids, batch, self.torch_runner)
@@ -486,6 +551,21 @@ class _TorchBenchRunner:
 
     def synchronize(self):
         synchronize(self.torch_runner.device)
+
+    def barrier(self):
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            get_tp_group().barrier()
+
+    def max_reduce(self, values):
+        if not values or not dist.is_initialized() or dist.get_world_size() == 1:
+            return list(values)
+        tensor = torch.tensor(values, dtype=torch.float64, device="cpu")
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=get_tp_group().cpu_group)
+        return tensor.tolist()
+
+    @property
+    def page_size(self):
+        return self.torch_runner.server_args.page_size
 
     def max_batch_size(self, input_len, output_len):
         return self.torch_runner.max_total_num_tokens // (input_len + output_len)
@@ -512,6 +592,11 @@ class _MlxBenchRunner:
         next_token_ids = self.mlx_runner.prefill_batch(req_ids, token_ids_list)
         return torch.tensor(next_token_ids), None, req_ids
 
+    def prefill(self, reqs, chunk_plan: ChunkPlan, trace_enabled: bool):
+        if chunk_plan.enabled:
+            raise ValueError("chunked one-batch prefill is not supported on MLX")
+        return self.extend(reqs)
+
     def decode(self, next_token_ids, req_ids):
         next_token_ids = self.mlx_runner.decode_batch(req_ids)
         return torch.tensor(next_token_ids), None
@@ -523,6 +608,16 @@ class _MlxBenchRunner:
 
     def synchronize(self):
         pass
+
+    def barrier(self):
+        pass
+
+    def max_reduce(self, values):
+        return list(values)
+
+    @property
+    def page_size(self):
+        return self.fake_torch_runner.server_args.page_size
 
     def max_batch_size(self, input_len, output_len):
         return self.fake_torch_runner.max_total_num_tokens // (input_len + output_len)
@@ -571,6 +666,14 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    if (
+        bench_args.chunked_prefill_size is not None
+        and bench_args.chunked_prefill_size > 0
+    ):
+        raise ValueError(
+            "--chunked-prefill-size is only supported by the one-batch latency test"
+        )
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -621,9 +724,28 @@ def synchronize(device):
     torch.get_device_module(device).synchronize()
 
 
+def get_deepep_phase_modes(server_args):
+    if server_args.moe_a2a_backend != "deepep":
+        return None
+
+    configured = server_args.deepep_mode
+    if configured == "auto":
+        prefill_mode = "normal"
+        decode_mode = "low_latency"
+    else:
+        prefill_mode = configured
+        decode_mode = configured
+    return {
+        "configured": configured,
+        "prefill": prefill_mode,
+        "decode": decode_mode,
+    }
+
+
 def latency_test_run_once(
     run_name,
     model_runner,
+    server_args,
     rank_print,
     reqs,
     batch_size,
@@ -638,6 +760,7 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
+    requested_chunked_prefill_size=None,
 ):
     max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
@@ -646,6 +769,13 @@ def latency_test_run_once(
         )
         return
 
+    chunk_plan = build_chunk_plan(
+        input_lengths=[len(req.fill_ids) for req in reqs],
+        requested_chunk_size=requested_chunked_prefill_size,
+        effective_chunk_size=server_args.chunked_prefill_size,
+        page_size=model_runner.page_size,
+    )
+
     model_runner.clear()
 
     measurement_results = {
@@ -653,10 +783,36 @@ def latency_test_run_once(
         "batch_size": batch_size,
         "input_len": input_len,
         "output_len": output_len,
+        "chunked_prefill": {
+            "enabled": chunk_plan.enabled,
+            "requested_size": chunk_plan.requested_chunk_size,
+            "effective_size": chunk_plan.effective_chunk_size,
+            "per_request_chunk_size": chunk_plan.per_request_chunk_size,
+            "num_chunks": chunk_plan.num_chunks,
+        },
     }
+    deepep_phase_modes = get_deepep_phase_modes(server_args)
+    if deepep_phase_modes is not None:
+        measurement_results["deepep_mode"] = deepep_phase_modes
+        rank_print(
+            "DeepEP phases. "
+            f"configured={deepep_phase_modes['configured']}, "
+            f"prefill={deepep_phase_modes['prefill']}, "
+            f"decode={deepep_phase_modes['decode']}"
+        )
+    rank_print(
+        "Chunked prefill. "
+        f"enabled={chunk_plan.enabled}, "
+        f"requested={chunk_plan.requested_chunk_size}, "
+        f"effective={chunk_plan.effective_chunk_size}, "
+        f"per_request={chunk_plan.per_request_chunk_size}, "
+        f"chunks={chunk_plan.num_chunks}"
+    )
 
     tot_latency = 0
 
+    # No rank may start prefill before every rank has finished setup.
+    model_runner.barrier()
     profiler = None
     enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
     if enable_profile_prefill:
@@ -666,9 +822,15 @@ def latency_test_run_once(
             rank_print=rank_print,
         )
 
+    trace_mark("phase/PREFILL_START", bool(profile))
     model_runner.synchronize()
     tic = time.perf_counter()
-    next_token_ids, _, batch = model_runner.extend(reqs)
+    with trace_range("prefill", enable_profile_prefill):
+        next_token_ids, _, batch = model_runner.prefill(
+            reqs,
+            chunk_plan=chunk_plan,
+            trace_enabled=enable_profile_prefill,
+        )
     model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
 
@@ -685,6 +847,12 @@ def latency_test_run_once(
             stage="prefill",
         )
 
+    # Stop the profiler before cross-rank synchronization so barriers and
+    # diagnostic reductions do not contaminate kernel timing.
+    model_runner.barrier()
+    trace_mark("phase_transition/PREFILL_DONE", bool(profile))
+    cluster_prefill_latency = model_runner.max_reduce([prefill_latency])[0]
+
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
     rank_print(
@@ -692,6 +860,10 @@ def latency_test_run_once(
     )
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
+
+    # This second gate makes decode start a distinct cluster-wide phase.
+    model_runner.barrier()
+    trace_mark("phase_transition/DECODE_START", bool(profile))
 
     decode_latencies = []
     # Determine profiling start step and end step
@@ -701,6 +873,7 @@ def latency_test_run_once(
     profile_end = profile_start + (profile_steps if profile_steps is not None else 1)
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     profiler = None
+    decode_profile_started = False
     for i in range(output_len - 1):
         model_runner.synchronize()
         # Start profiler at the specified step
@@ -710,14 +883,19 @@ def latency_test_run_once(
                 profile_record_shapes=profile_record_shapes,
                 rank_print=rank_print,
             )
+            decode_profile_started = True
 
         tic = time.perf_counter()
-        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
+        with trace_range(
+            f"decode/step_{i}",
+            enable_profile_decode and profile_start <= i < profile_end,
+        ):
+            next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         model_runner.synchronize()
         latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
-        if enable_profile_decode and profiler is not None and i >= profile_end - 1:
+        if enable_profile_decode and decode_profile_started and i >= profile_end - 1:
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode"
             )
@@ -730,6 +908,7 @@ def latency_test_run_once(
                 stage="decode",
             )
             profiler = None
+            decode_profile_started = False
 
         tot_latency += latency
         throughput = batch_size / latency
@@ -739,9 +918,25 @@ def latency_test_run_once(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
+    if decode_profile_started:
+        trace_filename = _create_torch_profiler_filename(
+            profile_filename_prefix, batch_size, input_len, output_len, "decode"
+        )
+        stop_profile(
+            profiler,
+            profile_activities,
+            rank_print=rank_print,
+            save_trace=True,
+            trace_filename=trace_filename,
+            stage="decode",
+        )
+
+    trace_mark("phase_transition/DECODE_DONE", bool(profile))
+
     # Record decode timing from 2nd output
+    med_decode_latency = None
     if output_len > 1:
-        med_decode_latency = np.median(decode_latencies)
+        med_decode_latency = float(np.median(decode_latencies))
         med_decode_throughput = batch_size / med_decode_latency
         rank_print(
             f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
@@ -755,6 +950,38 @@ def latency_test_run_once(
     )
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
+
+    cluster_latency_values = [tot_latency]
+    if med_decode_latency is not None:
+        cluster_latency_values.append(med_decode_latency)
+    cluster_latency_values = model_runner.max_reduce(cluster_latency_values)
+    cluster_total_latency = cluster_latency_values[0]
+    cluster_median_decode_latency = (
+        cluster_latency_values[1] if med_decode_latency is not None else None
+    )
+    cluster_metrics = build_cluster_metrics(
+        batch_size=batch_size,
+        dp_size=server_args.dp_size,
+        input_len=input_len,
+        output_len=output_len,
+        cluster_prefill_latency=cluster_prefill_latency,
+        cluster_median_decode_latency=cluster_median_decode_latency,
+        cluster_total_latency=cluster_total_latency,
+    )
+    measurement_results.update(cluster_metrics)
+    rank_print(
+        "Cluster. "
+        f"global batch size: {cluster_metrics['global_batch_size']}, "
+        f"prefill latency: {cluster_metrics['cluster_prefill_latency']:6.5f} s, "
+        f"total latency: {cluster_metrics['cluster_total_latency']:6.3f} s, "
+        f"overall throughput: {cluster_metrics['cluster_overall_throughput']:9.2f} token/s"
+    )
+    if "cluster_median_decode_latency" in cluster_metrics:
+        rank_print(
+            "Cluster decode. "
+            f"median latency: {cluster_metrics['cluster_median_decode_latency']:6.5f} s, "
+            f"median throughput: {cluster_metrics['cluster_median_decode_throughput']:9.2f} token/s"
+        )
 
     model_runner.cleanup(batch)
     return measurement_results
@@ -794,6 +1021,7 @@ def latency_test(
     latency_test_run_once(
         bench_args.run_name,
         model_runner,
+        server_args,
         rank_print,
         reqs,
         bench_args.batch_size[0],
@@ -808,6 +1036,7 @@ def latency_test(
         tp_rank=tp_rank,
         profile_start_step=None,
         profile_steps=None,
+        requested_chunked_prefill_size=bench_args.chunked_prefill_size,
     )
 
     rank_print("Benchmark ...")
@@ -845,6 +1074,7 @@ def latency_test(
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
+            server_args,
             rank_print,
             reqs,
             bs,
@@ -859,6 +1089,7 @@ def latency_test(
             tp_rank,
             bench_args.profile_start_step,
             bench_args.profile_steps,
+            bench_args.chunked_prefill_size,
         )
         if ret is not None:
             result_list.append(ret)
@@ -869,8 +1100,43 @@ def latency_test(
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
 
-    if server_args.tp_size > 1:
-        destroy_distributed_environment()
+
+def run_worker(work_func, server_args, port_args, bench_args, gpu_id, tp_rank):
+    try:
+        work_func(server_args, port_args, bench_args, gpu_id, tp_rank)
+    finally:
+        if dist.is_initialized():
+            for cleanup in (destroy_model_parallel, destroy_distributed_environment):
+                try:
+                    cleanup()
+                except Exception:
+                    logging.exception(
+                        "Failed to run distributed cleanup: %s", cleanup.__name__
+                    )
+
+
+def wait_for_workers(workers):
+    pending = list(workers)
+    failure = None
+    while pending and failure is None:
+        for proc in list(pending):
+            proc.join(timeout=0.1)
+            if proc.is_alive():
+                continue
+            pending.remove(proc)
+            if proc.exitcode != 0:
+                failure = (proc.pid, proc.exitcode)
+                break
+
+    if failure is not None:
+        for proc in pending:
+            proc.terminate()
+        for proc in pending:
+            proc.join()
+        pid, exitcode = failure
+        raise RuntimeError(
+            f"one-batch worker pid={pid} failed with exit code {exitcode}"
+        )
 
 
 def main(server_args, bench_args):
@@ -891,15 +1157,19 @@ def main(server_args, bench_args):
 
     port_args = PortArgs.init_new(server_args)
 
+    assignments = get_local_rank_assignments(
+        server_args.tp_size, server_args.nnodes, server_args.node_rank
+    )
     if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0, 0)
+        run_worker(work_func, server_args, port_args, bench_args, 0, 0)
     else:
         workers = []
-        for tp_rank in range(server_args.tp_size):
-            with maybe_reindex_device_id(tp_rank) as gpu_id:
+        for tp_rank, local_gpu_id in assignments:
+            with maybe_reindex_device_id(local_gpu_id) as gpu_id:
                 proc = multiprocessing.Process(
-                    target=work_func,
+                    target=run_worker,
                     args=(
+                        work_func,
                         server_args,
                         port_args,
                         bench_args,
@@ -910,10 +1180,7 @@ def main(server_args, bench_args):
                 proc.start()
                 workers.append(proc)
 
-        for proc in workers:
-            proc.join()
-
-        proc.terminate()
+        wait_for_workers(workers)
 
 
 if __name__ == "__main__":
