@@ -195,6 +195,71 @@ class TestDeepEPMicroWarmup(unittest.TestCase):
 
 
 class TestClusterMetrics(unittest.TestCase):
+    def test_prefill_wave_log_selection_covers_start_interval_and_final(self):
+        self.assertTrue(bench_utils.should_log_prefill_wave(1, 16))
+        self.assertTrue(bench_utils.should_log_prefill_wave(5, 16))
+        self.assertFalse(bench_utils.should_log_prefill_wave(6, 16))
+        self.assertTrue(bench_utils.should_log_prefill_wave(16, 16))
+        self.assertTrue(
+            bench_utils.should_log_prefill_wave(21, 16, is_final=True)
+        )
+        self.assertFalse(bench_utils.should_log_prefill_wave(1, 0))
+        self.assertFalse(
+            bench_utils.should_log_prefill_wave(21, 0, is_final=True)
+        )
+
+    def test_decode_step_metrics_report_tpot_and_both_throughputs(self):
+        metrics = bench_utils.build_decode_step_metrics(
+            batch_size=32,
+            dp_size=16,
+            latency=0.08,
+        )
+        self.assertEqual(metrics["tpot_ms"], 80.0)
+        self.assertEqual(metrics["throughput_per_dp"], 400.0)
+        self.assertEqual(metrics["cluster_throughput"], 6400.0)
+
+    def test_prefill_wave_metrics_use_cumulative_ready_tokens(self):
+        metrics = bench_utils.build_prefill_wave_metrics(
+            ready_batch_size=8,
+            dp_size=16,
+            input_len=4096,
+            elapsed=4.0,
+        )
+        self.assertEqual(metrics["throughput_per_dp"], 8192.0)
+        self.assertEqual(metrics["cluster_throughput"], 131072.0)
+
+    def test_capacity_usage_reports_device_and_hisparse_pools(self):
+        device = bench_utils.build_capacity_usage(
+            bench_utils.DeviceCapacitySnapshot(1000, 250, 8, 32768)
+        )
+        self.assertEqual(
+            device,
+            {
+                "device": {
+                    "used": 750,
+                    "available": 250,
+                    "total": 1000,
+                    "usage": 0.75,
+                }
+            },
+        )
+
+        hisparse = bench_utils.build_capacity_usage(
+            bench_utils.HiSparseCapacitySnapshot(
+                hot_total=100,
+                hot_available=25,
+                logical_total=1000,
+                logical_available=600,
+                host_total=2000,
+                host_available=1500,
+                request_slots_available=8,
+                max_context_len=32768,
+            )
+        )
+        self.assertEqual(hisparse["hot"]["usage"], 0.75)
+        self.assertEqual(hisparse["logical"]["used"], 400)
+        self.assertEqual(hisparse["host"]["used"], 500)
+
     def test_phase_breakdown_comes_from_the_slowest_prefill_rank(self):
         values = bench_utils.values_from_slowest_rank(
             [

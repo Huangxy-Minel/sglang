@@ -196,6 +196,78 @@ def seed_for_attention_dp_group(random_seed: int, attention_dp_rank: int) -> int
     return random_seed + attention_dp_rank
 
 
+def should_log_prefill_wave(
+    ready_batch_size: int, log_interval: int, is_final: bool = False
+) -> bool:
+    """Return whether a completed prefill wave should emit a progress log."""
+    if log_interval <= 0:
+        return False
+    return ready_batch_size <= 5 or ready_batch_size % log_interval == 0 or is_final
+
+
+def build_decode_step_metrics(
+    batch_size: int, dp_size: int, latency: float
+) -> dict[str, float]:
+    """Build TPOT and throughput metrics for one decode step."""
+    if batch_size <= 0 or dp_size <= 0:
+        raise ValueError("batch_size and dp_size must be positive")
+    if latency <= 0:
+        raise ValueError("latency must be positive")
+    return {
+        "tpot_ms": latency * 1000,
+        "throughput_per_dp": batch_size / latency,
+        "cluster_throughput": batch_size * dp_size / latency,
+    }
+
+
+def build_prefill_wave_metrics(
+    ready_batch_size: int, dp_size: int, input_len: int, elapsed: float
+) -> dict[str, float]:
+    """Build cumulative throughput metrics after a completed prefill wave."""
+    if ready_batch_size <= 0 or dp_size <= 0 or input_len <= 0:
+        raise ValueError("ready_batch_size, dp_size, and input_len must be positive")
+    if elapsed <= 0:
+        raise ValueError("elapsed must be positive")
+    throughput_per_dp = ready_batch_size * input_len / elapsed
+    return {
+        "throughput_per_dp": throughput_per_dp,
+        "cluster_throughput": throughput_per_dp * dp_size,
+    }
+
+
+def _pool_usage(total: int, available: int) -> dict[str, int | float]:
+    if total <= 0 or available < 0 or available > total:
+        raise ValueError(
+            f"invalid pool capacity: total={total}, available={available}"
+        )
+    used = total - available
+    return {
+        "used": used,
+        "available": available,
+        "total": total,
+        "usage": used / total,
+    }
+
+
+def build_capacity_usage(
+    snapshot: DeviceCapacitySnapshot | HiSparseCapacitySnapshot,
+) -> dict[str, dict[str, int | float]]:
+    """Convert a capacity snapshot to used/available/total pool metrics."""
+    if isinstance(snapshot, DeviceCapacitySnapshot):
+        return {
+            "device": _pool_usage(snapshot.device_total, snapshot.device_available)
+        }
+    if isinstance(snapshot, HiSparseCapacitySnapshot):
+        return {
+            "hot": _pool_usage(snapshot.hot_total, snapshot.hot_available),
+            "logical": _pool_usage(
+                snapshot.logical_total, snapshot.logical_available
+            ),
+            "host": _pool_usage(snapshot.host_total, snapshot.host_available),
+        }
+    raise TypeError(f"unsupported capacity snapshot: {type(snapshot).__name__}")
+
+
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 

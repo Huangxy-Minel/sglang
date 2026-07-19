@@ -68,15 +68,19 @@ from sglang.bench_one_batch_utils import (
     ChunkPlan,
     DeviceCapacitySnapshot,
     HiSparseCapacitySnapshot,
+    build_capacity_usage,
     build_chunk_plan,
     build_cluster_metrics,
+    build_decode_step_metrics,
     build_deepep_micro_warmup_shape,
+    build_prefill_wave_metrics,
     build_wave_chunk_plan,
     evaluate_device_wave_admission,
     evaluate_hisparse_wave_admission,
     get_local_rank_assignments,
     prepare_chunk_requests,
     seed_for_attention_dp_group,
+    should_log_prefill_wave,
     values_from_slowest_rank,
 )
 from sglang.srt.configs.model_config import ModelConfig
@@ -214,6 +218,7 @@ class BenchArgs:
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
+    log_prefill_wave: int = 0
     log_decode_step: int = 0
     profile: bool = False
     profile_record_shapes: bool = False
@@ -253,6 +258,15 @@ class BenchArgs:
         )
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
+        parser.add_argument(
+            "--log-prefill-wave",
+            type=int,
+            default=BenchArgs.log_prefill_wave,
+            help=(
+                "Log prefill progress for the first five waves, every N waves, "
+                "and the final admitted wave. Zero disables progress logs."
+            ),
+        )
         parser.add_argument(
             "--log-decode-step",
             type=int,
@@ -762,6 +776,9 @@ class _TorchBenchRunner:
         output_len,
         requested_chunk_size,
         effective_chunk_size,
+        dp_size,
+        log_prefill_wave,
+        rank_print,
         trace_enabled,
     ):
         chunk_plan = build_wave_chunk_plan(
@@ -779,6 +796,38 @@ class _TorchBenchRunner:
         staging_latency = 0.0
         control_latency = 0.0
         stop_reason = "target_reached"
+        progress_metrics = []
+        last_logged_ready_count = 0
+        prefill_tic = time.perf_counter()
+
+        def emit_progress(progress, final_reason=None):
+            nonlocal last_logged_ready_count
+            capacity_parts = []
+            for pool_name, pool in progress["capacity"].items():
+                label = {
+                    "device": "device KV",
+                    "hot": "hot KV",
+                    "logical": "logical KV",
+                    "host": "host KV",
+                }[pool_name]
+                capacity_parts.append(
+                    f"{label}: {pool['used']}/{pool['total']} slots "
+                    f"({pool['usage']:.2%})"
+                )
+            suffix = f", stop reason: {final_reason}" if final_reason else ""
+            rank_print(
+                f"Prefill wave {progress['wave']}. "
+                f"BS/DP: {progress['batch_size']}, "
+                f"global BS: {progress['global_batch_size']}, "
+                f"wave latency: {progress['wave_latency_s']:.5f} s, "
+                f"cumulative throughput/DP: "
+                f"{progress['throughput_per_dp']:.2f} token/s, "
+                f"cluster throughput (est.): "
+                f"{progress['cluster_throughput']:.2f} token/s, "
+                + ", ".join(capacity_parts)
+                + suffix
+            )
+            last_logged_ready_count = progress["batch_size"]
 
         try:
             while len(ready_reqs) < requested_batch_size:
@@ -829,6 +878,7 @@ class _TorchBenchRunner:
 
                 req = reqs[len(ready_reqs)]
                 wave_index = len(ready_reqs)
+                wave_tic = time.perf_counter()
                 self.synchronize()
                 compute_tic = time.perf_counter()
                 next_token_ids, _, _ = self.prefill(
@@ -867,6 +917,39 @@ class _TorchBenchRunner:
                 self.barrier()
                 control_latency += time.perf_counter() - control_tic
 
+                elapsed = time.perf_counter() - prefill_tic
+                wave_metrics = build_prefill_wave_metrics(
+                    ready_batch_size=len(ready_reqs),
+                    dp_size=dp_size,
+                    input_len=input_len,
+                    elapsed=elapsed,
+                )
+                progress = {
+                    "wave": wave_index + 1,
+                    "batch_size": len(ready_reqs),
+                    "global_batch_size": len(ready_reqs) * dp_size,
+                    "wave_latency_s": time.perf_counter() - wave_tic,
+                    "elapsed_s": elapsed,
+                    **wave_metrics,
+                    "capacity": build_capacity_usage(self._capacity_snapshot()),
+                }
+                progress_metrics.append(progress)
+                is_final = len(ready_reqs) >= requested_batch_size
+                if should_log_prefill_wave(
+                    len(ready_reqs), log_prefill_wave, is_final=is_final
+                ):
+                    emit_progress(
+                        progress,
+                        final_reason="target_reached" if is_final else None,
+                    )
+
+            if (
+                progress_metrics
+                and log_prefill_wave > 0
+                and last_logged_ready_count != len(ready_reqs)
+            ):
+                emit_progress(progress_metrics[-1], final_reason=stop_reason)
+
             if not ready_reqs:
                 raise RuntimeError(
                     "KV capacity rejected the first prefill wave: "
@@ -889,6 +972,7 @@ class _TorchBenchRunner:
             "staging_latency": staging_latency,
             "prefill_control_latency": control_latency,
             "capacity_snapshots": capacity_snapshots,
+            "progress_metrics": progress_metrics,
             "chunk_plan": chunk_plan,
         }
 
@@ -1189,6 +1273,7 @@ def latency_test_run_once(
     batch_size,
     input_len,
     output_len,
+    log_prefill_wave,
     log_decode_step,
     profile,
     profile_record_shapes,
@@ -1274,6 +1359,9 @@ def latency_test_run_once(
         output_len=output_len,
         requested_chunk_size=requested_chunked_prefill_size,
         effective_chunk_size=server_args.chunked_prefill_size,
+        dp_size=server_args.dp_size,
+        log_prefill_wave=log_prefill_wave,
+        rank_print=rank_print,
         trace_enabled=enable_profile_prefill,
     )
     batch_size = wave_prefill["batch_size"]
@@ -1408,11 +1496,21 @@ def latency_test_run_once(
             decode_profile_started = False
 
         tot_latency += latency
-        throughput = batch_size / latency
+        decode_metrics = build_decode_step_metrics(
+            batch_size=batch_size,
+            dp_size=server_args.dp_size,
+            latency=latency,
+        )
         decode_latencies.append(latency)
         if i < 5 or (log_decode_step > 0 and i % log_decode_step == 0):
             rank_print(
-                f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+                f"Decode {i}. BS/DP: {batch_size}, "
+                f"global BS: {batch_size * server_args.dp_size}, "
+                f"TPOT: {decode_metrics['tpot_ms']:.3f} ms/token, "
+                f"throughput/DP: "
+                f"{decode_metrics['throughput_per_dp']:.2f} token/s, "
+                f"cluster throughput (est.): "
+                f"{decode_metrics['cluster_throughput']:.2f} token/s"
             )
 
     if decode_profile_started:
@@ -1438,12 +1536,25 @@ def latency_test_run_once(
     med_decode_latency = None
     if output_len > 1:
         med_decode_latency = float(np.median(decode_latencies))
-        med_decode_throughput = batch_size / med_decode_latency
+        med_decode_metrics = build_decode_step_metrics(
+            batch_size=batch_size,
+            dp_size=server_args.dp_size,
+            latency=med_decode_latency,
+        )
         rank_print(
-            f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
+            f"Decode median. BS/DP: {batch_size}, "
+            f"global BS: {batch_size * server_args.dp_size}, "
+            f"TPOT: {med_decode_metrics['tpot_ms']:.3f} ms/token, "
+            f"throughput/DP: "
+            f"{med_decode_metrics['throughput_per_dp']:.2f} token/s, "
+            f"cluster throughput (est.): "
+            f"{med_decode_metrics['cluster_throughput']:.2f} token/s"
         )
         measurement_results["median_decode_latency"] = med_decode_latency
-        measurement_results["median_decode_throughput"] = med_decode_throughput
+        measurement_results["median_decode_tpot_ms"] = med_decode_metrics["tpot_ms"]
+        measurement_results["median_decode_throughput"] = med_decode_metrics[
+            "throughput_per_dp"
+        ]
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
@@ -1481,8 +1592,14 @@ def latency_test_run_once(
     if "cluster_median_decode_latency" in cluster_metrics:
         rank_print(
             "Cluster decode. "
-            f"median latency: {cluster_metrics['cluster_median_decode_latency']:6.5f} s, "
-            f"median throughput: {cluster_metrics['cluster_median_decode_throughput']:9.2f} token/s"
+            f"BS/DP: {batch_size}, "
+            f"global BS: {cluster_metrics['global_batch_size']}, "
+            f"TPOT: "
+            f"{cluster_metrics['cluster_median_decode_latency'] * 1000:.3f} ms/token, "
+            f"throughput/DP: "
+            f"{batch_size / cluster_metrics['cluster_median_decode_latency']:.2f} token/s, "
+            f"cluster throughput: "
+            f"{cluster_metrics['cluster_median_decode_throughput']:.2f} token/s"
         )
 
     model_runner.cleanup(batch)
@@ -1581,6 +1698,7 @@ def latency_test(
             min(
                 32, bench_args.output_len[0]
             ),  # shorter decoding to speed up the warmup
+            log_prefill_wave=0,
             log_decode_step=0,
             profile=False,
             profile_record_shapes=False,
@@ -1643,6 +1761,7 @@ def latency_test(
                 bs,
                 il,
                 ol,
+                bench_args.log_prefill_wave,
                 bench_args.log_decode_step,
                 bench_args.profile if tp_rank == 0 else None,
                 bench_args.profile_record_shapes if tp_rank == 0 else None,
