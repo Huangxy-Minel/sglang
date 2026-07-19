@@ -139,6 +139,8 @@ class DeepEPBuffer:
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
+    _num_nvl_bytes: int = 0
+    _num_rdma_bytes: int = 0
 
     @classmethod
     def get_deepep_buffer(
@@ -203,6 +205,9 @@ class DeepEPBuffer:
         else:
             raise NotImplementedError
 
+        cls._num_nvl_bytes = num_nvl_bytes
+        cls._num_rdma_bytes = num_rdma_bytes
+
         if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
                 device="cuda"
@@ -228,6 +233,11 @@ class DeepEPBuffer:
             allow_mnnvl=True,
         )
         return cls._buffer
+
+    @classmethod
+    def configured_buffer_bytes(cls) -> int:
+        """Return configured NVL and RDMA payload bytes for this GPU."""
+        return cls._num_nvl_bytes + cls._num_rdma_bytes
 
     @classmethod
     def clean_buffer(cls):

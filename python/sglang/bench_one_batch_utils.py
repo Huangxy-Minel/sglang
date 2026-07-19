@@ -6,7 +6,7 @@ chunk, and metric calculations can be unit tested on CPU-only machines.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from typing import Optional, Sequence
 
 
@@ -60,6 +60,94 @@ class DeviceAdmissionDecision:
     can_admit: bool
     stop_reason: str
     required_tokens: int
+
+
+@dataclass(frozen=True)
+class HBMUsageSnapshot:
+    total_bytes: int
+    free_bytes: int
+    model_bytes: int
+    kv_data_bytes: int
+    kv_indexer_bytes: int
+    cuda_graph_bytes: int
+    deepep_configured_bytes: int = 0
+
+
+def unique_cuda_storage_bytes(tensors: Sequence[object]) -> int:
+    """Count CUDA tensor storage once even when tensors share a backing store."""
+    storages: dict[tuple[str, int], int] = {}
+    for tensor in tensors:
+        device = str(getattr(tensor, "device", ""))
+        if not device.startswith("cuda"):
+            continue
+        storage = tensor.untyped_storage()
+        key = (device, storage.data_ptr())
+        storages[key] = max(storages.get(key, 0), storage.nbytes())
+    return sum(storages.values())
+
+
+def split_kv_pool_bytes(total_bytes: int, indexer_bytes: int) -> dict[str, int]:
+    if total_bytes < 0 or indexer_bytes < 0:
+        raise ValueError("KV storage values must be non-negative")
+    if indexer_bytes > total_bytes:
+        raise ValueError(
+            "indexer KV storage cannot exceed total KV pool storage: "
+            f"indexer={indexer_bytes}, total={total_bytes}"
+        )
+    return {
+        "kv_data_bytes": total_bytes - indexer_bytes,
+        "kv_indexer_bytes": indexer_bytes,
+    }
+
+
+def build_hbm_usage(snapshot: HBMUsageSnapshot) -> dict[str, int]:
+    """Build a non-overlapping per-GPU HBM ledger."""
+    values = {
+        field.name: getattr(snapshot, field.name)
+        for field in dataclass_fields(HBMUsageSnapshot)
+    }
+    if any(value < 0 for value in values.values()):
+        raise ValueError("HBM usage values must be non-negative")
+    if snapshot.free_bytes > snapshot.total_bytes:
+        raise ValueError("free HBM cannot exceed total HBM")
+
+    used_bytes = snapshot.total_bytes - snapshot.free_bytes
+    known_used_bytes = (
+        snapshot.model_bytes
+        + snapshot.kv_data_bytes
+        + snapshot.kv_indexer_bytes
+        + snapshot.cuda_graph_bytes
+    )
+    if known_used_bytes > used_bytes:
+        raise ValueError(
+            "known HBM categories exceed actual used HBM: "
+            f"known={known_used_bytes}, used={used_bytes}"
+        )
+
+    return {
+        **values,
+        "used_bytes": used_bytes,
+        "other_bytes": used_bytes - known_used_bytes,
+    }
+
+
+def summarize_hbm_usage(
+    snapshots: Sequence[HBMUsageSnapshot],
+) -> dict[str, object]:
+    """Summarize per-GPU HBM ledgers across ranks as min/avg/max."""
+    if not snapshots:
+        raise ValueError("at least one HBM snapshot is required")
+
+    usages = [build_hbm_usage(snapshot) for snapshot in snapshots]
+    summary: dict[str, object] = {"num_ranks": len(usages)}
+    for name in usages[0]:
+        values = [usage[name] for usage in usages]
+        summary[name] = {
+            "min": min(values),
+            "avg": sum(values) / len(values),
+            "max": max(values),
+        }
+    return summary
 
 
 def build_deepep_micro_warmup_shape(

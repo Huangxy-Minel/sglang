@@ -67,6 +67,7 @@ import torch.distributed as dist
 from sglang.bench_one_batch_utils import (
     ChunkPlan,
     DeviceCapacitySnapshot,
+    HBMUsageSnapshot,
     HiSparseCapacitySnapshot,
     build_capacity_usage,
     build_chunk_plan,
@@ -81,6 +82,9 @@ from sglang.bench_one_batch_utils import (
     prepare_chunk_requests,
     seed_for_attention_dp_group,
     should_log_prefill_wave,
+    split_kv_pool_bytes,
+    summarize_hbm_usage,
+    unique_cuda_storage_bytes,
     values_from_slowest_rank,
 )
 from sglang.srt.configs.model_config import ModelConfig
@@ -1089,6 +1093,66 @@ class _TorchBenchRunner:
         if self._active_batch is not None:
             self.cleanup(self._active_batch)
 
+    def _hbm_usage_snapshot(self) -> HBMUsageSnapshot:
+        runner = self.torch_runner
+        free_bytes, total_bytes = torch.cuda.mem_get_info(runner.gpu_id)
+
+        model_tensors = list(runner.model.parameters()) + list(
+            runner.model.buffers()
+        )
+        model_bytes = unique_cuda_storage_bytes(model_tensors)
+
+        kv_cache = runner.token_to_kv_pool_allocator.get_kvcache()
+        kv_total_bytes = kv_cache.get_kv_size_bytes()
+        if isinstance(kv_total_bytes, tuple):
+            kv_total_bytes = sum(kv_total_bytes)
+        indexer_bytes = unique_cuda_storage_bytes(
+            getattr(kv_cache, "index_k_with_scale_buffer", ())
+        )
+        kv_usage = split_kv_pool_bytes(int(kv_total_bytes), indexer_bytes)
+
+        deepep_configured_bytes = 0
+        if runner.server_args.moe_a2a_backend == "deepep":
+            from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+
+            deepep_configured_bytes = DeepEPBuffer.configured_buffer_bytes()
+
+        return HBMUsageSnapshot(
+            total_bytes=total_bytes,
+            free_bytes=free_bytes,
+            model_bytes=model_bytes,
+            kv_data_bytes=kv_usage["kv_data_bytes"],
+            kv_indexer_bytes=kv_usage["kv_indexer_bytes"],
+            cuda_graph_bytes=max(
+                0, int(round(runner.graph_mem_usage * (1 << 30)))
+            ),
+            deepep_configured_bytes=deepep_configured_bytes,
+        )
+
+    def hbm_usage_summary(self):
+        snapshot = self._hbm_usage_snapshot()
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return summarize_hbm_usage([snapshot])
+
+        field_names = [field.name for field in dataclasses.fields(snapshot)]
+        local_values = torch.tensor(
+            [getattr(snapshot, name) for name in field_names],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        gathered = [
+            torch.empty_like(local_values)
+            for _ in range(dist.get_world_size(group=get_tp_group().cpu_group))
+        ]
+        dist.all_gather(gathered, local_values, group=get_tp_group().cpu_group)
+        snapshots = [
+            HBMUsageSnapshot(
+                **dict(zip(field_names, [int(value) for value in values.tolist()]))
+            )
+            for values in gathered
+        ]
+        return summarize_hbm_usage(snapshots)
+
     def synchronize(self):
         synchronize(self.torch_runner.device)
 
@@ -1121,6 +1185,7 @@ class _TorchBenchRunner:
     @property
     def page_size(self):
         return self.torch_runner.server_args.page_size
+
 
 class _MlxBenchRunner:
     """Wraps MlxModelRunner for the MLX benchmark path."""
@@ -1175,9 +1240,13 @@ class _MlxBenchRunner:
     def values_from_slowest_rank(self, values):
         return list(values)
 
+    def hbm_usage_summary(self):
+        return None
+
     @property
     def page_size(self):
         return self.fake_torch_runner.server_args.page_size
+
 
 def _read_prompts_from_file(prompt_file, rank_print):
     """Read custom prompts from the file specified by `--prompt-filename`."""
@@ -1300,6 +1369,41 @@ def get_deepep_phase_modes(server_args):
     }
 
 
+def print_hbm_usage_report(summary, rank_print):
+    if summary is None:
+        return
+
+    gib = 1 << 30
+    num_ranks = summary["num_ranks"]
+
+    def format_row(label, key, indent=""):
+        values = summary[key]
+        rank_print(
+            f"{indent}{label:<39} "
+            f"{values['min'] / gib:8.2f} / "
+            f"{values['avg'] / gib:8.2f} / "
+            f"{values['max'] / gib:8.2f} GiB"
+        )
+
+    rank_print("=== HBM Usage Report ===")
+    rank_print(
+        f"Per-GPU GiB (min / avg / max across {num_ranks} model ranks)"
+    )
+    format_row("Model", "model_bytes")
+    format_row("KV data pool", "kv_data_bytes")
+    format_row("KV indexer pool", "kv_indexer_bytes")
+    format_row("CUDA Graph", "cuda_graph_bytes")
+    format_row("Other (DeepEP/NCCL/runtime)", "other_bytes")
+    format_row(
+        "DeepEP configured buffers (in Other)",
+        "deepep_configured_bytes",
+        indent="  ",
+    )
+    format_row("Free", "free_bytes")
+    format_row("Total", "total_bytes")
+    rank_print("========================")
+
+
 def latency_test_run_once(
     run_name,
     model_runner,
@@ -1320,6 +1424,7 @@ def latency_test_run_once(
     profile_start_step=None,
     profile_steps=None,
     requested_chunked_prefill_size=None,
+    report_hbm_usage=False,
 ):
     requested_batch_size = batch_size
     is_hisparse = getattr(model_runner, "is_hisparse", False)
@@ -1477,6 +1582,12 @@ def latency_test_run_once(
         f"staging={measurement_results['staging_latency']:6.5f} s, "
         f"control={measurement_results['prefill_control_latency']:6.5f} s"
     )
+
+    if report_hbm_usage:
+        hbm_usage = model_runner.hbm_usage_summary()
+        if hbm_usage is not None:
+            measurement_results["hbm_usage_bytes"] = hbm_usage
+            print_hbm_usage_report(hbm_usage, rank_print)
 
     # This second gate makes decode start a distinct cluster-wide phase.
     model_runner.barrier()
@@ -1845,6 +1956,7 @@ def latency_test(
                 bench_args.profile_start_step,
                 bench_args.profile_steps,
                 bench_args.chunked_prefill_size,
+                report_hbm_usage=True,
             )
         finally:
             model_runner.cleanup_active_batch()

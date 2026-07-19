@@ -195,6 +195,113 @@ class TestDeepEPMicroWarmup(unittest.TestCase):
 
 
 class TestClusterMetrics(unittest.TestCase):
+    def test_unique_storage_bytes_deduplicates_shared_cuda_storage(self):
+        class FakeStorage:
+            def __init__(self, ptr, size):
+                self._ptr = ptr
+                self._size = size
+
+            def data_ptr(self):
+                return self._ptr
+
+            def nbytes(self):
+                return self._size
+
+        class FakeTensor:
+            def __init__(self, device, storage):
+                self.device = device
+                self._storage = storage
+
+            def untyped_storage(self):
+                return self._storage
+
+        shared = FakeStorage(100, 4096)
+        tensors = [
+            FakeTensor("cuda:0", shared),
+            FakeTensor("cuda:0", shared),
+            FakeTensor("cuda:0", FakeStorage(200, 1024)),
+            FakeTensor("cpu", FakeStorage(300, 8192)),
+        ]
+
+        self.assertEqual(bench_utils.unique_cuda_storage_bytes(tensors), 5120)
+
+    def test_kv_pool_usage_splits_indexer_without_double_counting(self):
+        self.assertEqual(
+            bench_utils.split_kv_pool_bytes(1000, 250),
+            {"kv_data_bytes": 750, "kv_indexer_bytes": 250},
+        )
+        with self.assertRaisesRegex(ValueError, "indexer KV storage"):
+            bench_utils.split_kv_pool_bytes(100, 101)
+
+    def test_hbm_usage_uses_a_non_overlapping_residual_ledger(self):
+        usage = bench_utils.build_hbm_usage(
+            bench_utils.HBMUsageSnapshot(
+                total_bytes=1000,
+                free_bytes=100,
+                model_bytes=400,
+                kv_data_bytes=200,
+                kv_indexer_bytes=50,
+                cuda_graph_bytes=100,
+                deepep_configured_bytes=80,
+            )
+        )
+
+        self.assertEqual(usage["used_bytes"], 900)
+        self.assertEqual(usage["other_bytes"], 150)
+        self.assertEqual(usage["deepep_configured_bytes"], 80)
+        self.assertEqual(
+            usage["model_bytes"]
+            + usage["kv_data_bytes"]
+            + usage["kv_indexer_bytes"]
+            + usage["cuda_graph_bytes"]
+            + usage["other_bytes"]
+            + usage["free_bytes"],
+            usage["total_bytes"],
+        )
+
+    def test_hbm_usage_rejects_impossible_accounting(self):
+        with self.assertRaisesRegex(ValueError, "known HBM categories"):
+            bench_utils.build_hbm_usage(
+                bench_utils.HBMUsageSnapshot(
+                    total_bytes=1000,
+                    free_bytes=100,
+                    model_bytes=700,
+                    kv_data_bytes=200,
+                    kv_indexer_bytes=50,
+                    cuda_graph_bytes=100,
+                )
+            )
+
+    def test_hbm_usage_summary_reports_per_gpu_min_avg_max(self):
+        summary = bench_utils.summarize_hbm_usage(
+            [
+                bench_utils.HBMUsageSnapshot(
+                    total_bytes=1000,
+                    free_bytes=100,
+                    model_bytes=400,
+                    kv_data_bytes=200,
+                    kv_indexer_bytes=50,
+                    cuda_graph_bytes=100,
+                    deepep_configured_bytes=80,
+                ),
+                bench_utils.HBMUsageSnapshot(
+                    total_bytes=1000,
+                    free_bytes=80,
+                    model_bytes=400,
+                    kv_data_bytes=200,
+                    kv_indexer_bytes=50,
+                    cuda_graph_bytes=100,
+                    deepep_configured_bytes=80,
+                ),
+            ]
+        )
+
+        self.assertEqual(summary["num_ranks"], 2)
+        self.assertEqual(summary["free_bytes"], {"min": 80, "avg": 90, "max": 100})
+        self.assertEqual(
+            summary["other_bytes"], {"min": 150, "avg": 160, "max": 170}
+        )
+
     def test_prefill_wave_log_selection_covers_start_interval_and_final(self):
         self.assertTrue(bench_utils.should_log_prefill_wave(1, 16))
         self.assertTrue(bench_utils.should_log_prefill_wave(5, 16))
