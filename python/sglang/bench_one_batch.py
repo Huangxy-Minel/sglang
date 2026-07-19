@@ -522,13 +522,20 @@ def extend(reqs, model_runner, sample: bool = True):
 
 
 @torch.no_grad
-def decode(input_token_ids, batch, model_runner):
+def prepare_decode_forward_batch(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     batch.is_extend_in_batch = False
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    return ForwardBatch.init_new(model_worker_batch, model_runner)
+
+
+@torch.no_grad
+def decode(input_token_ids, batch, model_runner):
+    forward_batch = prepare_decode_forward_batch(
+        input_token_ids, batch, model_runner
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
@@ -978,6 +985,35 @@ class _TorchBenchRunner:
 
     def decode(self, next_token_ids, batch):
         return decode(next_token_ids, batch, self.torch_runner)
+
+    def decode_with_core_timing(
+        self,
+        next_token_ids,
+        batch,
+        *,
+        trace_enabled: bool,
+        trace_name: str,
+    ):
+        forward_batch = prepare_decode_forward_batch(
+            next_token_ids, batch, self.torch_runner
+        )
+
+        # Drain preparation kernels before timing the model forward. The
+        # post-forward synchronize includes model compute and communication
+        # completion, while sampling remains part of full decode latency only.
+        self.synchronize()
+        with trace_range(trace_name, trace_enabled):
+            core_tic = time.perf_counter()
+            logits_output = self.torch_runner.forward(forward_batch).logits_output
+            self.synchronize()
+            core_forward_tpot = time.perf_counter() - core_tic
+
+        next_token_ids = self.torch_runner.sample(logits_output, forward_batch)
+        return (
+            next_token_ids,
+            logits_output.next_token_logits,
+            core_forward_tpot,
+        )
 
     def _release_request(self, req):
         if req.req_pool_idx is None:
@@ -1446,7 +1482,8 @@ def latency_test_run_once(
     model_runner.barrier()
     trace_mark("phase_transition/DECODE_START", bool(profile))
 
-    decode_latencies = []
+    decode_process_latencies = []
+    core_forward_tpots = []
     # Determine profiling start step and end step
     profile_start = (
         profile_start_step if profile_start_step is not None else (output_len // 2)
@@ -1471,9 +1508,18 @@ def latency_test_run_once(
             f"decode/step_{i}",
             enable_profile_decode and profile_start <= i < profile_end,
         ):
-            next_token_ids, _ = model_runner.decode(next_token_ids, batch)
+            next_token_ids, _, core_forward_tpot = (
+                model_runner.decode_with_core_timing(
+                    next_token_ids,
+                    batch,
+                    trace_enabled=(
+                        enable_profile_decode and profile_start <= i < profile_end
+                    ),
+                    trace_name=f"decode/step_{i}/core_forward",
+                )
+            )
         model_runner.synchronize()
-        latency = time.perf_counter() - tic
+        process_latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
         if enable_profile_decode and decode_profile_started and i >= profile_end - 1:
@@ -1495,18 +1541,22 @@ def latency_test_run_once(
             profiler = None
             decode_profile_started = False
 
-        tot_latency += latency
+        tot_latency += process_latency
         decode_metrics = build_decode_step_metrics(
             batch_size=batch_size,
             dp_size=server_args.dp_size,
-            latency=latency,
+            process_latency=process_latency,
+            core_forward_tpot=core_forward_tpot,
         )
-        decode_latencies.append(latency)
+        decode_process_latencies.append(process_latency)
+        core_forward_tpots.append(core_forward_tpot)
         if i < 5 or (log_decode_step > 0 and i % log_decode_step == 0):
             rank_print(
                 f"Decode {i}. BS/DP: {batch_size}, "
                 f"global BS: {batch_size * server_args.dp_size}, "
-                f"TPOT: {decode_metrics['tpot_ms']:.3f} ms/token, "
+                f"process latency: "
+                f"{decode_metrics['process_latency_ms']:.3f} ms, "
+                f"core TPOT: {decode_metrics['tpot_ms']:.3f} ms/token, "
                 f"throughput/DP: "
                 f"{decode_metrics['throughput_per_dp']:.2f} token/s, "
                 f"cluster throughput (est.): "
@@ -1532,29 +1582,44 @@ def latency_test_run_once(
 
     trace_mark("phase_transition/DECODE_DONE", bool(profile))
 
-    # Record decode timing from 2nd output
+    # Record full decode process latency and core model-forward TPOT.
     med_decode_latency = None
+    med_core_forward_tpot = None
     if output_len > 1:
-        med_decode_latency = float(np.median(decode_latencies))
+        med_decode_latency = float(np.median(decode_process_latencies))
+        med_core_forward_tpot = float(np.median(core_forward_tpots))
         med_decode_metrics = build_decode_step_metrics(
             batch_size=batch_size,
             dp_size=server_args.dp_size,
-            latency=med_decode_latency,
+            process_latency=med_decode_latency,
+            core_forward_tpot=med_core_forward_tpot,
         )
         rank_print(
             f"Decode median. BS/DP: {batch_size}, "
             f"global BS: {batch_size * server_args.dp_size}, "
-            f"TPOT: {med_decode_metrics['tpot_ms']:.3f} ms/token, "
+            f"process latency: "
+            f"{med_decode_metrics['process_latency_ms']:.3f} ms, "
+            f"core TPOT: {med_decode_metrics['tpot_ms']:.3f} ms/token, "
             f"throughput/DP: "
             f"{med_decode_metrics['throughput_per_dp']:.2f} token/s, "
             f"cluster throughput (est.): "
             f"{med_decode_metrics['cluster_throughput']:.2f} token/s"
         )
         measurement_results["median_decode_latency"] = med_decode_latency
+        measurement_results["median_decode_latency_ms"] = med_decode_metrics[
+            "process_latency_ms"
+        ]
+        measurement_results["median_core_forward_tpot"] = med_core_forward_tpot
+        measurement_results["median_core_forward_tpot_ms"] = med_decode_metrics[
+            "tpot_ms"
+        ]
         measurement_results["median_decode_tpot_ms"] = med_decode_metrics["tpot_ms"]
         measurement_results["median_decode_throughput"] = med_decode_metrics[
             "throughput_per_dp"
         ]
+        measurement_results["median_decode_throughput_per_dp"] = (
+            med_decode_metrics["throughput_per_dp"]
+        )
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
@@ -1565,11 +1630,16 @@ def latency_test_run_once(
 
     cluster_latency_values = [tot_latency]
     if med_decode_latency is not None:
-        cluster_latency_values.append(med_decode_latency)
+        cluster_latency_values.extend(
+            [med_decode_latency, med_core_forward_tpot]
+        )
     cluster_latency_values = model_runner.max_reduce(cluster_latency_values)
     cluster_total_latency = cluster_latency_values[0]
     cluster_median_decode_latency = (
         cluster_latency_values[1] if med_decode_latency is not None else None
+    )
+    cluster_median_core_forward_tpot = (
+        cluster_latency_values[2] if med_decode_latency is not None else None
     )
     cluster_metrics = build_cluster_metrics(
         batch_size=batch_size,
@@ -1579,6 +1649,7 @@ def latency_test_run_once(
         output_len=output_len,
         cluster_prefill_latency=cluster_prefill_latency,
         cluster_median_decode_latency=cluster_median_decode_latency,
+        cluster_median_core_forward_tpot=cluster_median_core_forward_tpot,
         cluster_total_latency=cluster_total_latency,
     )
     measurement_results.update(cluster_metrics)
@@ -1594,10 +1665,12 @@ def latency_test_run_once(
             "Cluster decode. "
             f"BS/DP: {batch_size}, "
             f"global BS: {cluster_metrics['global_batch_size']}, "
-            f"TPOT: "
-            f"{cluster_metrics['cluster_median_decode_latency'] * 1000:.3f} ms/token, "
+            f"process latency: "
+            f"{cluster_metrics['cluster_median_decode_latency_ms']:.3f} ms, "
+            f"core TPOT: "
+            f"{cluster_metrics['cluster_median_core_forward_tpot_ms']:.3f} ms/token, "
             f"throughput/DP: "
-            f"{batch_size / cluster_metrics['cluster_median_decode_latency']:.2f} token/s, "
+            f"{cluster_metrics['cluster_median_decode_throughput_per_dp']:.2f} token/s, "
             f"cluster throughput: "
             f"{cluster_metrics['cluster_median_decode_throughput']:.2f} token/s"
         )

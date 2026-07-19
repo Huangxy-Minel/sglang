@@ -206,17 +206,21 @@ def should_log_prefill_wave(
 
 
 def build_decode_step_metrics(
-    batch_size: int, dp_size: int, latency: float
+    batch_size: int,
+    dp_size: int,
+    process_latency: float,
+    core_forward_tpot: float,
 ) -> dict[str, float]:
-    """Build TPOT and throughput metrics for one decode step."""
+    """Build full-step latency and core-forward TPOT metrics."""
     if batch_size <= 0 or dp_size <= 0:
         raise ValueError("batch_size and dp_size must be positive")
-    if latency <= 0:
-        raise ValueError("latency must be positive")
+    if process_latency <= 0 or core_forward_tpot <= 0:
+        raise ValueError("process_latency and core_forward_tpot must be positive")
     return {
-        "tpot_ms": latency * 1000,
-        "throughput_per_dp": batch_size / latency,
-        "cluster_throughput": batch_size * dp_size / latency,
+        "process_latency_ms": process_latency * 1000,
+        "tpot_ms": core_forward_tpot * 1000,
+        "throughput_per_dp": batch_size / core_forward_tpot,
+        "cluster_throughput": batch_size * dp_size / core_forward_tpot,
     }
 
 
@@ -425,6 +429,7 @@ def build_cluster_metrics(
     cluster_median_decode_latency: Optional[float],
     cluster_total_latency: float,
     requested_batch_size: Optional[int] = None,
+    cluster_median_core_forward_tpot: Optional[float] = None,
 ) -> dict[str, float | int]:
     """Calculate metrics from latencies already max-reduced across ranks."""
     if cluster_prefill_latency <= 0:
@@ -436,6 +441,11 @@ def build_cluster_metrics(
         and cluster_median_decode_latency <= 0
     ):
         raise ValueError("cluster_median_decode_latency must be positive")
+    if (
+        cluster_median_core_forward_tpot is not None
+        and cluster_median_core_forward_tpot <= 0
+    ):
+        raise ValueError("cluster_median_core_forward_tpot must be positive")
 
     requested_batch_size = requested_batch_size or batch_size
     global_batch_size = batch_size * dp_size
@@ -456,11 +466,24 @@ def build_cluster_metrics(
         ),
     }
     if cluster_median_decode_latency is not None:
+        core_tpot = (
+            cluster_median_core_forward_tpot
+            if cluster_median_core_forward_tpot is not None
+            else cluster_median_decode_latency
+        )
         result.update(
             {
                 "cluster_median_decode_latency": cluster_median_decode_latency,
+                "cluster_median_decode_latency_ms": (
+                    cluster_median_decode_latency * 1000
+                ),
+                "cluster_median_core_forward_tpot": core_tpot,
+                "cluster_median_core_forward_tpot_ms": core_tpot * 1000,
+                "cluster_median_decode_throughput_per_dp": (
+                    batch_size / core_tpot
+                ),
                 "cluster_median_decode_throughput": (
-                    global_batch_size / cluster_median_decode_latency
+                    global_batch_size / core_tpot
                 ),
             }
         )

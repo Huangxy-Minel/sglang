@@ -212,8 +212,10 @@ class TestClusterMetrics(unittest.TestCase):
         metrics = bench_utils.build_decode_step_metrics(
             batch_size=32,
             dp_size=16,
-            latency=0.08,
+            process_latency=0.085,
+            core_forward_tpot=0.08,
         )
+        self.assertEqual(metrics["process_latency_ms"], 85.0)
         self.assertEqual(metrics["tpot_ms"], 80.0)
         self.assertEqual(metrics["throughput_per_dp"], 400.0)
         self.assertEqual(metrics["cluster_throughput"], 6400.0)
@@ -278,13 +280,18 @@ class TestClusterMetrics(unittest.TestCase):
             output_len=3,
             cluster_prefill_latency=4.0,
             cluster_median_decode_latency=1.0,
+            cluster_median_core_forward_tpot=0.8,
             cluster_total_latency=5.25,
         )
         self.assertEqual(metrics["global_batch_size"], 512)
         self.assertEqual(metrics["cluster_prefill_latency"], 4.0)
         self.assertEqual(metrics["cluster_prefill_throughput"], 524288.0)
         self.assertEqual(metrics["cluster_median_decode_latency"], 1.0)
-        self.assertAlmostEqual(metrics["cluster_median_decode_throughput"], 512.0)
+        self.assertEqual(metrics["cluster_median_core_forward_tpot"], 0.8)
+        self.assertAlmostEqual(
+            metrics["cluster_median_decode_throughput_per_dp"], 40.0
+        )
+        self.assertAlmostEqual(metrics["cluster_median_decode_throughput"], 640.0)
         self.assertEqual(metrics["cluster_total_latency"], 5.25)
         self.assertAlmostEqual(
             metrics["cluster_overall_throughput"],
@@ -300,6 +307,7 @@ class TestClusterMetrics(unittest.TestCase):
             output_len=128,
             cluster_prefill_latency=8.0,
             cluster_median_decode_latency=0.1,
+            cluster_median_core_forward_tpot=0.08,
             cluster_total_latency=9.0,
         )
         self.assertEqual(metrics["requested_batch_size"], 128)
