@@ -77,9 +77,11 @@ from sglang.bench_one_batch_utils import (
     build_deepep_micro_warmup_shape,
     build_prefill_wave_metrics,
     build_wave_chunk_plan,
+    disable_cuda_graph_replay,
     evaluate_device_wave_admission,
     evaluate_hisparse_wave_admission,
     get_local_rank_assignments,
+    normalize_profile_activities,
     prepare_chunk_requests,
     seed_for_attention_dp_group,
     should_log_prefill_wave,
@@ -130,6 +132,7 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
     Abstracted function to start profiling based on profile_activities.
     Returns profiler object (or None).
     """
+    profile_activities = normalize_profile_activities(profile_activities)
     if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStart()
@@ -146,6 +149,10 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
         if "XPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.XPU)
         if activities:
+            rank_print(
+                "Torch profiler started. "
+                f"activities={','.join(profile_activities)}"
+            )
             profiler = torch.profiler.profile(
                 activities=activities,
                 with_stack=True,
@@ -1025,9 +1032,17 @@ class _TorchBenchRunner:
         self.synchronize()
         with trace_range(trace_name, trace_enabled):
             core_tic = time.perf_counter()
-            logits_output = self.torch_runner.forward(
-                forward_batch, force_eager=force_eager
-            ).logits_output
+            with disable_cuda_graph_replay(
+                self.torch_runner, enabled=force_eager
+            ):
+                model_output = self.torch_runner.forward(
+                    forward_batch, force_eager=force_eager
+                )
+            if force_eager and model_output.can_run_graph:
+                raise RuntimeError(
+                    "profile force-eager decode unexpectedly used CUDA Graph"
+                )
+            logits_output = model_output.logits_output
             self.synchronize()
             core_forward_tpot = time.perf_counter() - core_tic
 
@@ -1630,6 +1645,17 @@ def latency_test_run_once(
     decode_process_latencies = []
     core_forward_tpots = []
     enable_profile_decode = profile_owner and decode_profile_plan.enabled
+    if enable_profile_decode:
+        normalized_profile_activities = normalize_profile_activities(
+            profile_activities
+        )
+        rank_print(
+            "Decode profile window. "
+            f"steps=[{decode_profile_plan.start_step}, "
+            f"{decode_profile_plan.end_step}), "
+            f"force_eager={decode_profile_plan.force_eager}, "
+            f"activities={','.join(normalized_profile_activities)}"
+        )
     profiler = None
     decode_profile_started = False
     profile_capture_completed = False

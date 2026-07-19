@@ -6,8 +6,9 @@ chunk, and metric calculations can be unit tested on CPU-only machines.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, fields as dataclass_fields
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,34 @@ class HBMUsageSnapshot:
     kv_indexer_bytes: int
     cuda_graph_bytes: int
     deepep_configured_bytes: int = 0
+
+
+def normalize_profile_activities(
+    profile_activities: Sequence[str],
+) -> tuple[str, ...]:
+    """Keep CPU ranges whenever CUDA kernels are captured by torch profiler."""
+    activities = list(dict.fromkeys(profile_activities))
+    if "GPU" in activities and "CPU" not in activities:
+        activities.insert(0, "CPU")
+    return tuple(activities)
+
+
+@contextmanager
+def disable_cuda_graph_replay(model_runner: Any, enabled: bool):
+    """Temporarily make both SGLang CUDA graph runners unavailable."""
+    if not enabled:
+        yield
+        return
+
+    graph_runner = model_runner.graph_runner
+    piecewise_graph_runner = model_runner.piecewise_cuda_graph_runner
+    model_runner.graph_runner = None
+    model_runner.piecewise_cuda_graph_runner = None
+    try:
+        yield
+    finally:
+        model_runner.graph_runner = graph_runner
+        model_runner.piecewise_cuda_graph_runner = piecewise_graph_runner
 
 
 def build_decode_profile_plan(

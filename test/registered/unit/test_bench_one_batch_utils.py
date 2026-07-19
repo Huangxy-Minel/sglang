@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -149,6 +150,42 @@ class TestChunkPlan(unittest.TestCase):
 
 
 class TestDecodeProfilePlan(unittest.TestCase):
+    def test_gpu_profile_also_captures_cpu_ranges(self):
+        self.assertEqual(
+            bench_utils.normalize_profile_activities(("GPU",)),
+            ("CPU", "GPU"),
+        )
+
+    def test_force_eager_temporarily_disables_graph_runners(self):
+        graph_runner = object()
+        piecewise_graph_runner = object()
+        runner = types.SimpleNamespace(
+            graph_runner=graph_runner,
+            piecewise_cuda_graph_runner=piecewise_graph_runner,
+        )
+
+        with bench_utils.disable_cuda_graph_replay(runner, enabled=True):
+            self.assertIsNone(runner.graph_runner)
+            self.assertIsNone(runner.piecewise_cuda_graph_runner)
+
+        self.assertIs(runner.graph_runner, graph_runner)
+        self.assertIs(runner.piecewise_cuda_graph_runner, piecewise_graph_runner)
+
+    def test_force_eager_restores_graph_runners_after_failure(self):
+        graph_runner = object()
+        piecewise_graph_runner = object()
+        runner = types.SimpleNamespace(
+            graph_runner=graph_runner,
+            piecewise_cuda_graph_runner=piecewise_graph_runner,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            with bench_utils.disable_cuda_graph_replay(runner, enabled=True):
+                raise RuntimeError("boom")
+
+        self.assertIs(runner.graph_runner, graph_runner)
+        self.assertIs(runner.piecewise_cuda_graph_runner, piecewise_graph_runner)
+
     def test_profile_window_skips_16_steps_then_profiles_8(self):
         plan = bench_utils.build_decode_profile_plan(
             output_len=128,
