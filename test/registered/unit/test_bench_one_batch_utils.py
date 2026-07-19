@@ -148,6 +148,62 @@ class TestChunkPlan(unittest.TestCase):
         self.assertEqual(req.extend_input_len, 128)
 
 
+class TestDecodeProfilePlan(unittest.TestCase):
+    def test_profile_window_skips_16_steps_then_profiles_8(self):
+        plan = bench_utils.build_decode_profile_plan(
+            output_len=128,
+            profile_enabled=True,
+            profile_stage="decode",
+            profile_start_step=16,
+            profile_steps=8,
+            force_eager=True,
+            exit_after_capture=True,
+        )
+
+        self.assertFalse(plan.action_for_step(15).profile)
+        self.assertFalse(plan.action_for_step(15).force_eager)
+        self.assertTrue(plan.action_for_step(16).profile)
+        self.assertTrue(plan.action_for_step(23).force_eager)
+        self.assertTrue(plan.action_for_step(23).exit_after_step)
+        self.assertFalse(plan.action_for_step(24).profile)
+        self.assertEqual(plan.executed_steps_after_capture, 24)
+        self.assertEqual(plan.profiled_steps, 8)
+
+    def test_profile_window_rejects_invalid_bounds(self):
+        with self.assertRaisesRegex(ValueError, "decode iterations"):
+            bench_utils.build_decode_profile_plan(
+                output_len=24,
+                profile_enabled=True,
+                profile_stage="decode",
+                profile_start_step=16,
+                profile_steps=8,
+                force_eager=True,
+                exit_after_capture=True,
+            )
+
+    def test_profile_controls_require_decode_profiling(self):
+        with self.assertRaisesRegex(ValueError, "require --profile"):
+            bench_utils.build_decode_profile_plan(
+                output_len=128,
+                profile_enabled=False,
+                profile_stage="decode",
+                profile_start_step=16,
+                profile_steps=8,
+                force_eager=True,
+                exit_after_capture=True,
+            )
+        with self.assertRaisesRegex(ValueError, "decode profile stage"):
+            bench_utils.build_decode_profile_plan(
+                output_len=128,
+                profile_enabled=True,
+                profile_stage="prefill",
+                profile_start_step=16,
+                profile_steps=8,
+                force_eager=True,
+                exit_after_capture=True,
+            )
+
+
 class TestDeepEPMicroWarmup(unittest.TestCase):
     def test_auto_and_normal_modes_get_page_aligned_prefill_only_shape(self):
         self.assertEqual(

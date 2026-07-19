@@ -2647,6 +2647,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
+        force_eager: bool = False,
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
@@ -2659,7 +2660,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["get_embedding"] = True
 
         can_run_graph = (
-            self.piecewise_cuda_graph_runner is not None
+            not force_eager
+            and self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
 
@@ -2729,6 +2731,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        force_eager: bool = False,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
@@ -2742,6 +2745,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+                force_eager,
             )
             elastic_ep_state = ElasticEPStateManager.instance()
             if (
@@ -2763,6 +2767,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     pp_proxy_tensors,
                     reinit_attn_backend,
                     split_forward_count,
+                    force_eager,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
@@ -2788,6 +2793,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        force_eager: bool = False,
     ) -> ModelRunnerOutput:
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
@@ -2795,7 +2801,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else forward_batch.forward_mode.is_cuda_graph
         )
         can_run_graph = bool(
-            mode_check()
+            not force_eager
+            and mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
@@ -2850,6 +2857,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
+                force_eager=force_eager,
             )
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)

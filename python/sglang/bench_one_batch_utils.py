@@ -21,6 +21,42 @@ class ChunkPlan:
 
 
 @dataclass(frozen=True)
+class DecodeProfileStepAction:
+    profile: bool
+    force_eager: bool
+    exit_after_step: bool
+
+
+@dataclass(frozen=True)
+class DecodeProfilePlan:
+    enabled: bool
+    start_step: int
+    end_step: int
+    force_eager: bool
+    exit_after_capture: bool
+
+    @property
+    def profiled_steps(self) -> int:
+        return self.end_step - self.start_step if self.enabled else 0
+
+    @property
+    def executed_steps_after_capture(self) -> int:
+        return self.end_step if self.enabled and self.exit_after_capture else 0
+
+    def action_for_step(self, step: int) -> DecodeProfileStepAction:
+        in_window = self.enabled and self.start_step <= step < self.end_step
+        return DecodeProfileStepAction(
+            profile=in_window,
+            force_eager=in_window and self.force_eager,
+            exit_after_step=(
+                in_window
+                and self.exit_after_capture
+                and step == self.end_step - 1
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class HiSparseCapacitySnapshot:
     hot_total: int
     hot_available: int
@@ -71,6 +107,67 @@ class HBMUsageSnapshot:
     kv_indexer_bytes: int
     cuda_graph_bytes: int
     deepep_configured_bytes: int = 0
+
+
+def build_decode_profile_plan(
+    output_len: int,
+    profile_enabled: bool,
+    profile_stage: str,
+    profile_start_step: Optional[int],
+    profile_steps: Optional[int],
+    force_eager: bool,
+    exit_after_capture: bool,
+) -> DecodeProfilePlan:
+    """Validate and describe the decode profiler capture window."""
+    if output_len <= 0:
+        raise ValueError(f"output_len must be positive, got {output_len}")
+
+    has_profile_control = force_eager or exit_after_capture
+    if has_profile_control and not profile_enabled:
+        raise ValueError(
+            "--profile-force-eager and --profile-exit-after-capture require --profile"
+        )
+
+    decode_enabled = profile_enabled and profile_stage in ("all", "decode")
+    if has_profile_control and not decode_enabled:
+        raise ValueError(
+            "profile force-eager and early-exit controls require a decode profile stage"
+        )
+
+    if not decode_enabled:
+        return DecodeProfilePlan(
+            enabled=False,
+            start_step=0,
+            end_step=0,
+            force_eager=False,
+            exit_after_capture=False,
+        )
+
+    start_step = (
+        profile_start_step if profile_start_step is not None else output_len // 2
+    )
+    steps = profile_steps if profile_steps is not None else 1
+    if start_step < 0:
+        raise ValueError(f"profile_start_step must be non-negative, got {start_step}")
+    if steps <= 0:
+        raise ValueError(f"profile_steps must be positive, got {steps}")
+
+    decode_iterations = output_len - 1
+    end_step = start_step + steps
+    if end_step > decode_iterations:
+        raise ValueError(
+            "decode profile window exceeds available decode iterations: "
+            f"start={start_step}, steps={steps}, "
+            f"decode_iterations={decode_iterations}"
+        )
+
+    return DecodeProfilePlan(
+        enabled=True,
+        start_step=start_step,
+        end_step=end_step,
+        force_eager=force_eager,
+        exit_after_capture=exit_after_capture,
+    )
 
 
 def unique_cuda_storage_bytes(tensors: Sequence[object]) -> int:

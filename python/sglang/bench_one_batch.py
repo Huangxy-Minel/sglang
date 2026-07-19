@@ -72,6 +72,7 @@ from sglang.bench_one_batch_utils import (
     build_capacity_usage,
     build_chunk_plan,
     build_cluster_metrics,
+    build_decode_profile_plan,
     build_decode_step_metrics,
     build_deepep_micro_warmup_shape,
     build_prefill_wave_metrics,
@@ -231,6 +232,8 @@ class BenchArgs:
     profile_filename_prefix: str = "profile"
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
+    profile_force_eager: bool = False
+    profile_exit_after_capture: bool = False
     # This option is registered by ServerArgs. Keeping the raw CLI value here
     # lets one-batch distinguish an explicit request from an automatic default.
     chunked_prefill_size: Optional[int] = None
@@ -316,6 +319,16 @@ class BenchArgs:
             type=int,
             default=None,
             help="Number of decode steps to profile starting from profile-start-step. If not specified, profiles only one step.",
+        )
+        parser.add_argument(
+            "--profile-force-eager",
+            action="store_true",
+            help="Run only the profiled decode window without CUDA Graph replay.",
+        )
+        parser.add_argument(
+            "--profile-exit-after-capture",
+            action="store_true",
+            help="Exit the benchmark after the decode profile window is saved.",
         )
 
     @classmethod
@@ -1000,6 +1013,7 @@ class _TorchBenchRunner:
         *,
         trace_enabled: bool,
         trace_name: str,
+        force_eager: bool = False,
     ):
         forward_batch = prepare_decode_forward_batch(
             next_token_ids, batch, self.torch_runner
@@ -1011,7 +1025,9 @@ class _TorchBenchRunner:
         self.synchronize()
         with trace_range(trace_name, trace_enabled):
             core_tic = time.perf_counter()
-            logits_output = self.torch_runner.forward(forward_batch).logits_output
+            logits_output = self.torch_runner.forward(
+                forward_batch, force_eager=force_eager
+            ).logits_output
             self.synchronize()
             core_forward_tpot = time.perf_counter() - core_tic
 
@@ -1429,6 +1445,8 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
+    profile_force_eager=False,
+    profile_exit_after_capture=False,
     requested_chunked_prefill_size=None,
     report_hbm_usage=False,
 ):
@@ -1446,6 +1464,16 @@ def latency_test_run_once(
         effective_chunk_size=server_args.chunked_prefill_size,
         page_size=model_runner.page_size,
     )
+    decode_profile_plan = build_decode_profile_plan(
+        output_len=output_len,
+        profile_enabled=bool(profile),
+        profile_stage=profile_stage,
+        profile_start_step=profile_start_step,
+        profile_steps=profile_steps,
+        force_eager=profile_force_eager,
+        exit_after_capture=profile_exit_after_capture,
+    )
+    profile_owner = bool(profile) and tp_rank == 0
 
     model_runner.clear()
 
@@ -1488,7 +1516,7 @@ def latency_test_run_once(
     # No rank may start prefill before every rank has finished setup.
     model_runner.barrier()
     profiler = None
-    enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
+    enable_profile_prefill = profile_owner and profile_stage in ["all", "prefill"]
     if enable_profile_prefill:
         profiler = start_profile(
             profile_activities,
@@ -1496,7 +1524,7 @@ def latency_test_run_once(
             rank_print=rank_print,
         )
 
-    trace_mark("phase/PREFILL_START", bool(profile))
+    trace_mark("phase/PREFILL_START", profile_owner)
     model_runner.synchronize()
     tic = time.perf_counter()
     next_token_ids, batch, wave_prefill = model_runner.prefill_waves(
@@ -1548,7 +1576,7 @@ def latency_test_run_once(
     # Stop the profiler before cross-rank synchronization so barriers and
     # diagnostic reductions do not contaminate kernel timing.
     model_runner.barrier()
-    trace_mark("phase_transition/PREFILL_DONE", bool(profile))
+    trace_mark("phase_transition/PREFILL_DONE", profile_owner)
     local_control_latency = max(
         0.0,
         prefill_latency
@@ -1597,22 +1625,19 @@ def latency_test_run_once(
 
     # This second gate makes decode start a distinct cluster-wide phase.
     model_runner.barrier()
-    trace_mark("phase_transition/DECODE_START", bool(profile))
+    trace_mark("phase_transition/DECODE_START", profile_owner)
 
     decode_process_latencies = []
     core_forward_tpots = []
-    # Determine profiling start step and end step
-    profile_start = (
-        profile_start_step if profile_start_step is not None else (output_len // 2)
-    )
-    profile_end = profile_start + (profile_steps if profile_steps is not None else 1)
-    enable_profile_decode = profile and profile_stage in ["all", "decode"]
+    enable_profile_decode = profile_owner and decode_profile_plan.enabled
     profiler = None
     decode_profile_started = False
+    profile_capture_completed = False
     for i in range(output_len - 1):
+        profile_action = decode_profile_plan.action_for_step(i)
         model_runner.synchronize()
         # Start profiler at the specified step
-        if enable_profile_decode and i == profile_start:
+        if enable_profile_decode and i == decode_profile_plan.start_step:
             profiler = start_profile(
                 profile_activities,
                 profile_record_shapes=profile_record_shapes,
@@ -1623,23 +1648,28 @@ def latency_test_run_once(
         tic = time.perf_counter()
         with trace_range(
             f"decode/step_{i}",
-            enable_profile_decode and profile_start <= i < profile_end,
+            enable_profile_decode and profile_action.profile,
         ):
             next_token_ids, _, core_forward_tpot = (
                 model_runner.decode_with_core_timing(
                     next_token_ids,
                     batch,
                     trace_enabled=(
-                        enable_profile_decode and profile_start <= i < profile_end
+                        enable_profile_decode and profile_action.profile
                     ),
                     trace_name=f"decode/step_{i}/core_forward",
+                    force_eager=profile_action.force_eager,
                 )
             )
         model_runner.synchronize()
         process_latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
-        if enable_profile_decode and decode_profile_started and i >= profile_end - 1:
+        if (
+            enable_profile_decode
+            and decode_profile_started
+            and i >= decode_profile_plan.end_step - 1
+        ):
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix,
                 requested_batch_size,
@@ -1657,6 +1687,12 @@ def latency_test_run_once(
             )
             profiler = None
             decode_profile_started = False
+
+        if (
+            decode_profile_plan.enabled
+            and i == decode_profile_plan.end_step - 1
+        ):
+            profile_capture_completed = True
 
         tot_latency += process_latency
         decode_metrics = build_decode_step_metrics(
@@ -1680,6 +1716,10 @@ def latency_test_run_once(
                 f"{decode_metrics['cluster_throughput']:.2f} token/s"
             )
 
+        if profile_action.exit_after_step:
+            model_runner.barrier()
+            break
+
     if decode_profile_started:
         trace_filename = _create_torch_profiler_filename(
             profile_filename_prefix,
@@ -1697,12 +1737,31 @@ def latency_test_run_once(
             stage="decode",
         )
 
-    trace_mark("phase_transition/DECODE_DONE", bool(profile))
+    trace_mark("phase_transition/DECODE_DONE", profile_owner)
+
+    measurement_results["executed_decode_steps"] = len(decode_process_latencies)
+    if decode_profile_plan.enabled:
+        profile_early_exit = (
+            profile_capture_completed
+            and decode_profile_plan.exit_after_capture
+        )
+        measurement_results.update(
+            {
+                "profile_early_exit": profile_early_exit,
+                "profiled_decode_steps": (
+                    decode_profile_plan.profiled_steps
+                    if profile_capture_completed
+                    else 0
+                ),
+                "profile_start_step": decode_profile_plan.start_step,
+                "profile_end_step": decode_profile_plan.end_step,
+            }
+        )
 
     # Record full decode process latency and core model-forward TPOT.
     med_decode_latency = None
     med_core_forward_tpot = None
-    if output_len > 1:
+    if decode_process_latencies:
         med_decode_latency = float(np.median(decode_process_latencies))
         med_core_forward_tpot = float(np.median(core_forward_tpots))
         med_decode_metrics = build_decode_step_metrics(
@@ -1737,6 +1796,16 @@ def latency_test_run_once(
         measurement_results["median_decode_throughput_per_dp"] = (
             med_decode_metrics["throughput_per_dp"]
         )
+
+    if measurement_results.get("profile_early_exit", False):
+        rank_print(
+            "Profile capture complete. "
+            f"executed decode steps={len(decode_process_latencies)}, "
+            f"profiled steps={decode_profile_plan.profiled_steps}; "
+            "skipping complete-output end-to-end metrics."
+        )
+        model_runner.cleanup(batch)
+        return measurement_results
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
@@ -1898,6 +1967,8 @@ def latency_test(
             tp_rank=tp_rank,
             profile_start_step=None,
             profile_steps=None,
+            profile_force_eager=False,
+            profile_exit_after_capture=False,
             requested_chunked_prefill_size=bench_args.chunked_prefill_size,
         )
     finally:
@@ -1953,7 +2024,7 @@ def latency_test(
                 ol,
                 bench_args.log_prefill_wave,
                 bench_args.log_decode_step,
-                bench_args.profile if tp_rank == 0 else None,
+                bench_args.profile,
                 bench_args.profile_record_shapes if tp_rank == 0 else None,
                 bench_args.profile_activities,
                 bench_args.profile_filename_prefix,
@@ -1961,6 +2032,8 @@ def latency_test(
                 tp_rank,
                 bench_args.profile_start_step,
                 bench_args.profile_steps,
+                bench_args.profile_force_eager,
+                bench_args.profile_exit_after_capture,
                 bench_args.chunked_prefill_size,
                 report_hbm_usage=True,
             )
@@ -1968,6 +2041,8 @@ def latency_test(
             model_runner.cleanup_active_batch()
         if ret is not None:
             result_list.append(ret)
+            if ret.get("profile_early_exit", False):
+                break
 
     # Write results in jsonlines format on rank 0.
     if tp_rank == 0 and bench_args.result_filename:
