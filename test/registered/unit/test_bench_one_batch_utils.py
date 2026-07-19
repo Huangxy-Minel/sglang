@@ -193,7 +193,7 @@ class TestDecodeProfilePlan(unittest.TestCase):
             profile_stage="decode",
             profile_start_step=16,
             profile_steps=8,
-            force_eager=True,
+            execution_mode="eager",
             exit_after_capture=True,
         )
 
@@ -205,6 +205,24 @@ class TestDecodeProfilePlan(unittest.TestCase):
         self.assertFalse(plan.action_for_step(24).profile)
         self.assertEqual(plan.executed_steps_after_capture, 24)
         self.assertEqual(plan.profiled_steps, 8)
+        self.assertEqual(plan.execution_mode, "eager")
+
+    def test_runtime_mode_profiles_the_same_window_without_forcing_eager(self):
+        plan = bench_utils.build_decode_profile_plan(
+            output_len=128,
+            profile_enabled=True,
+            profile_stage="decode",
+            profile_start_step=16,
+            profile_steps=8,
+            execution_mode="runtime",
+            exit_after_capture=False,
+        )
+
+        self.assertFalse(plan.action_for_step(15).profile)
+        self.assertTrue(plan.action_for_step(16).profile)
+        self.assertFalse(plan.action_for_step(16).force_eager)
+        self.assertTrue(plan.action_for_step(23).profile)
+        self.assertFalse(plan.action_for_step(23).force_eager)
 
     def test_profile_window_rejects_invalid_bounds(self):
         with self.assertRaisesRegex(ValueError, "decode iterations"):
@@ -214,8 +232,20 @@ class TestDecodeProfilePlan(unittest.TestCase):
                 profile_stage="decode",
                 profile_start_step=16,
                 profile_steps=8,
-                force_eager=True,
+                execution_mode="eager",
                 exit_after_capture=True,
+            )
+
+    def test_profile_window_rejects_invalid_execution_mode(self):
+        with self.assertRaisesRegex(ValueError, "profile execution mode"):
+            bench_utils.build_decode_profile_plan(
+                output_len=128,
+                profile_enabled=True,
+                profile_stage="decode",
+                profile_start_step=16,
+                profile_steps=8,
+                execution_mode="graph",
+                exit_after_capture=False,
             )
 
     def test_profile_controls_require_decode_profiling(self):
@@ -226,7 +256,7 @@ class TestDecodeProfilePlan(unittest.TestCase):
                 profile_stage="decode",
                 profile_start_step=16,
                 profile_steps=8,
-                force_eager=True,
+                execution_mode="eager",
                 exit_after_capture=True,
             )
         with self.assertRaisesRegex(ValueError, "decode profile stage"):
@@ -236,7 +266,7 @@ class TestDecodeProfilePlan(unittest.TestCase):
                 profile_stage="prefill",
                 profile_start_step=16,
                 profile_steps=8,
-                force_eager=True,
+                execution_mode="eager",
                 exit_after_capture=True,
             )
 

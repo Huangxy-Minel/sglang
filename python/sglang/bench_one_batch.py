@@ -239,7 +239,7 @@ class BenchArgs:
     profile_filename_prefix: str = "profile"
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
-    profile_force_eager: bool = False
+    profile_execution_mode: str = "runtime"
     profile_exit_after_capture: bool = False
     # This option is registered by ServerArgs. Keeping the raw CLI value here
     # lets one-batch distinguish an explicit request from an automatic default.
@@ -328,9 +328,14 @@ class BenchArgs:
             help="Number of decode steps to profile starting from profile-start-step. If not specified, profiles only one step.",
         )
         parser.add_argument(
-            "--profile-force-eager",
-            action="store_true",
-            help="Run only the profiled decode window without CUDA Graph replay.",
+            "--profile-execution-mode",
+            choices=["runtime", "eager"],
+            default=BenchArgs.profile_execution_mode,
+            help=(
+                "Execution path inside the decode profile window: runtime "
+                "preserves normal CUDA Graph eligibility; eager bypasses "
+                "SGLang CUDA Graph replay only while profiling."
+            ),
         )
         parser.add_argument(
             "--profile-exit-after-capture",
@@ -1460,7 +1465,7 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
-    profile_force_eager=False,
+    profile_execution_mode="runtime",
     profile_exit_after_capture=False,
     requested_chunked_prefill_size=None,
     report_hbm_usage=False,
@@ -1485,7 +1490,7 @@ def latency_test_run_once(
         profile_stage=profile_stage,
         profile_start_step=profile_start_step,
         profile_steps=profile_steps,
-        force_eager=profile_force_eager,
+        execution_mode=profile_execution_mode,
         exit_after_capture=profile_exit_after_capture,
     )
     profile_owner = bool(profile) and tp_rank == 0
@@ -1653,7 +1658,7 @@ def latency_test_run_once(
             "Decode profile window. "
             f"steps=[{decode_profile_plan.start_step}, "
             f"{decode_profile_plan.end_step}), "
-            f"force_eager={decode_profile_plan.force_eager}, "
+            f"execution_mode={decode_profile_plan.execution_mode}, "
             f"activities={','.join(normalized_profile_activities)}"
         )
     profiler = None
@@ -1993,7 +1998,7 @@ def latency_test(
             tp_rank=tp_rank,
             profile_start_step=None,
             profile_steps=None,
-            profile_force_eager=False,
+            profile_execution_mode="runtime",
             profile_exit_after_capture=False,
             requested_chunked_prefill_size=bench_args.chunked_prefill_size,
         )
@@ -2058,7 +2063,7 @@ def latency_test(
                 tp_rank,
                 bench_args.profile_start_step,
                 bench_args.profile_steps,
-                bench_args.profile_force_eager,
+                bench_args.profile_execution_mode,
                 bench_args.profile_exit_after_capture,
                 bench_args.chunked_prefill_size,
                 report_hbm_usage=True,

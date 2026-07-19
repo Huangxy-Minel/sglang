@@ -33,7 +33,7 @@ class DecodeProfilePlan:
     enabled: bool
     start_step: int
     end_step: int
-    force_eager: bool
+    execution_mode: str
     exit_after_capture: bool
 
     @property
@@ -48,7 +48,7 @@ class DecodeProfilePlan:
         in_window = self.enabled and self.start_step <= step < self.end_step
         return DecodeProfileStepAction(
             profile=in_window,
-            force_eager=in_window and self.force_eager,
+            force_eager=in_window and self.execution_mode == "eager",
             exit_after_step=(
                 in_window
                 and self.exit_after_capture
@@ -144,23 +144,30 @@ def build_decode_profile_plan(
     profile_stage: str,
     profile_start_step: Optional[int],
     profile_steps: Optional[int],
-    force_eager: bool,
+    execution_mode: str,
     exit_after_capture: bool,
 ) -> DecodeProfilePlan:
     """Validate and describe the decode profiler capture window."""
     if output_len <= 0:
         raise ValueError(f"output_len must be positive, got {output_len}")
+    if execution_mode not in ("runtime", "eager"):
+        raise ValueError(
+            "profile execution mode must be 'runtime' or 'eager', "
+            f"got {execution_mode!r}"
+        )
 
-    has_profile_control = force_eager or exit_after_capture
+    has_profile_control = execution_mode != "runtime" or exit_after_capture
     if has_profile_control and not profile_enabled:
         raise ValueError(
-            "--profile-force-eager and --profile-exit-after-capture require --profile"
+            "--profile-execution-mode eager and --profile-exit-after-capture "
+            "require --profile"
         )
 
     decode_enabled = profile_enabled and profile_stage in ("all", "decode")
     if has_profile_control and not decode_enabled:
         raise ValueError(
-            "profile force-eager and early-exit controls require a decode profile stage"
+            "profile execution-mode and early-exit controls require a decode "
+            "profile stage"
         )
 
     if not decode_enabled:
@@ -168,7 +175,7 @@ def build_decode_profile_plan(
             enabled=False,
             start_step=0,
             end_step=0,
-            force_eager=False,
+            execution_mode="runtime",
             exit_after_capture=False,
         )
 
@@ -194,7 +201,7 @@ def build_decode_profile_plan(
         enabled=True,
         start_step=start_step,
         end_step=end_step,
-        force_eager=force_eager,
+        execution_mode=execution_mode,
         exit_after_capture=exit_after_capture,
     )
 
