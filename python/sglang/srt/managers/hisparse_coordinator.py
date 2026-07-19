@@ -191,7 +191,6 @@ class HiSparseCoordinator:
 
         req.staging = False
         req.hisparse_staging = False
-        req.hisparse_host_only = False
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
@@ -281,7 +280,6 @@ class HiSparseCoordinator:
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             req.hisparse_staging = False
-            req.hisparse_host_only = False
             self._skip_first_backup[req.req_pool_idx] = True
             ready_reqs.append(req)
         return ready_reqs
@@ -307,7 +305,6 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator.free_hisparse_indices(device_indices)
 
             req.hisparse_staging = False
-            req.hisparse_host_only = True
             host_ready_reqs.append(req)
         return host_ready_reqs
 
@@ -592,7 +589,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
-        req.hisparse_host_only = False
 
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
@@ -629,7 +625,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
-        req.hisparse_host_only = False
 
     def swap_in_selected_pages(
         self,

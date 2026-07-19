@@ -75,14 +75,15 @@ from sglang.bench_one_batch_utils import (
     build_decode_profile_plan,
     build_decode_step_metrics,
     build_deepep_micro_warmup_shape,
+    build_profile_trace_filename,
     build_prefill_wave_metrics,
     build_wave_chunk_plan,
-    disable_cuda_graph_replay,
     evaluate_device_wave_admission,
     evaluate_hisparse_wave_admission,
     get_local_rank_assignments,
     normalize_profile_activities,
     prepare_chunk_requests,
+    resolve_one_batch_cuda_graph_max_bs,
     seed_for_attention_dp_group,
     should_log_prefill_wave,
     split_kv_pool_bytes,
@@ -127,7 +128,12 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 
-def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
+def start_profile(
+    profile_activities,
+    profile_record_shapes=False,
+    profile_with_stack=False,
+    rank_print=print,
+):
     """
     Abstracted function to start profiling based on profile_activities.
     Returns profiler object (or None).
@@ -155,7 +161,7 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
             )
             profiler = torch.profiler.profile(
                 activities=activities,
-                with_stack=True,
+                with_stack=profile_with_stack,
                 record_shapes=profile_record_shapes,
             )
             profiler.start()
@@ -214,11 +220,6 @@ def trace_range(name: str, enabled: bool):
             torch.cuda.nvtx.range_pop()
 
 
-def trace_mark(name: str, enabled: bool):
-    if enabled and torch.cuda.is_available():
-        torch.cuda.nvtx.mark(name)
-
-
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
@@ -234,9 +235,11 @@ class BenchArgs:
     log_decode_step: int = 0
     profile: bool = False
     profile_record_shapes: bool = False
+    profile_with_stack: bool = False
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
     profile_filename_prefix: str = "profile"
+    profile_output_dir: Optional[str] = None
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
     profile_execution_mode: str = "runtime"
@@ -294,6 +297,11 @@ class BenchArgs:
             help="Record tensor shapes in profiling results.",
         )
         parser.add_argument(
+            "--profile-with-stack",
+            action="store_true",
+            help="Capture Python stacks in profiling results.",
+        )
+        parser.add_argument(
             "--profile-activities",
             type=str,
             nargs="+",
@@ -312,8 +320,20 @@ class BenchArgs:
             "--profile-filename-prefix",
             type=str,
             default=BenchArgs.profile_filename_prefix,
-            help="Prefix of the profiling file names. The full profiling result file(s) be "
-            '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+            help=(
+                "Prefix of profile filenames. The generated name also includes "
+                "the runtime TP/DP/EP topology, admitted batch size, input/output "
+                "lengths, and profiled stage."
+            ),
+        )
+        parser.add_argument(
+            "--profile-output-dir",
+            type=str,
+            default=None,
+            help=(
+                "Directory for torch profiler traces. Defaults to "
+                "SGLANG_TORCH_PROFILER_DIR or /tmp."
+            ),
         )
         parser.add_argument(
             "--profile-start-step",
@@ -1037,12 +1057,9 @@ class _TorchBenchRunner:
         self.synchronize()
         with trace_range(trace_name, trace_enabled):
             core_tic = time.perf_counter()
-            with disable_cuda_graph_replay(
-                self.torch_runner, enabled=force_eager
-            ):
-                model_output = self.torch_runner.forward(
-                    forward_batch, force_eager=force_eager
-                )
+            model_output = self.torch_runner.forward(
+                forward_batch, force_eager=force_eager
+            )
             if force_eager and model_output.can_run_graph:
                 raise RuntimeError(
                     "profile force-eager decode unexpectedly used CUDA Graph"
@@ -1072,10 +1089,7 @@ class _TorchBenchRunner:
             coordinator = runner.hisparse_coordinator
             if req.hisparse_staging:
                 coordinator.abort_staging_request(req)
-            elif (
-                req.hisparse_host_only
-                or int(coordinator.req_device_buffer_size[req.req_pool_idx]) > 0
-            ):
+            else:
                 coordinator.request_finished(req)
 
         allocator.free(allocated_locs)
@@ -1308,11 +1322,25 @@ def _get_torch_profiler_output_dir():
 
 
 def _create_torch_profiler_filename(
-    profile_filename_prefix, batch_size, input_len, output_len, stage
+    profile_output_dir,
+    profile_filename_prefix,
+    batch_size,
+    input_len,
+    output_len,
+    stage,
+    server_args,
 ):
-    output_dir = _get_torch_profiler_output_dir()
-    filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.trace.json.gz"
-    return os.path.join(output_dir, filename)
+    return build_profile_trace_filename(
+        output_dir=profile_output_dir or _get_torch_profiler_output_dir(),
+        prefix=profile_filename_prefix,
+        batch_size=batch_size,
+        input_len=input_len,
+        output_len=output_len,
+        stage=stage,
+        tp_size=server_args.tp_size,
+        dp_size=server_args.dp_size,
+        ep_size=server_args.ep_size or server_args.tp_size,
+    )
 
 
 def _save_profile_trace_results(profiler, filename):
@@ -1459,7 +1487,9 @@ def latency_test_run_once(
     log_decode_step,
     profile,
     profile_record_shapes,
+    profile_with_stack,
     profile_activities,
+    profile_output_dir,
     profile_filename_prefix,
     profile_stage,
     tp_rank,
@@ -1541,10 +1571,10 @@ def latency_test_run_once(
         profiler = start_profile(
             profile_activities,
             profile_record_shapes=profile_record_shapes,
+            profile_with_stack=profile_with_stack,
             rank_print=rank_print,
         )
 
-    trace_mark("phase/PREFILL_START", profile_owner)
     model_runner.synchronize()
     tic = time.perf_counter()
     next_token_ids, batch, wave_prefill = model_runner.prefill_waves(
@@ -1578,11 +1608,13 @@ def latency_test_run_once(
 
     if enable_profile_prefill:
         trace_filename = _create_torch_profiler_filename(
+            profile_output_dir,
             profile_filename_prefix,
-            requested_batch_size,
+            batch_size,
             input_len,
             output_len,
             "prefill",
+            server_args,
         )
         stop_profile(
             profiler,
@@ -1596,7 +1628,6 @@ def latency_test_run_once(
     # Stop the profiler before cross-rank synchronization so barriers and
     # diagnostic reductions do not contaminate kernel timing.
     model_runner.barrier()
-    trace_mark("phase_transition/PREFILL_DONE", profile_owner)
     local_control_latency = max(
         0.0,
         prefill_latency
@@ -1645,7 +1676,6 @@ def latency_test_run_once(
 
     # This second gate makes decode start a distinct cluster-wide phase.
     model_runner.barrier()
-    trace_mark("phase_transition/DECODE_START", profile_owner)
 
     decode_process_latencies = []
     core_forward_tpots = []
@@ -1672,6 +1702,7 @@ def latency_test_run_once(
             profiler = start_profile(
                 profile_activities,
                 profile_record_shapes=profile_record_shapes,
+                profile_with_stack=profile_with_stack,
                 rank_print=rank_print,
             )
             decode_profile_started = True
@@ -1702,11 +1733,13 @@ def latency_test_run_once(
             and i >= decode_profile_plan.end_step - 1
         ):
             trace_filename = _create_torch_profiler_filename(
+                profile_output_dir,
                 profile_filename_prefix,
-                requested_batch_size,
+                batch_size,
                 input_len,
                 output_len,
                 "decode",
+                server_args,
             )
             stop_profile(
                 profiler,
@@ -1753,11 +1786,13 @@ def latency_test_run_once(
 
     if decode_profile_started:
         trace_filename = _create_torch_profiler_filename(
+            profile_output_dir,
             profile_filename_prefix,
-            requested_batch_size,
+            batch_size,
             input_len,
             output_len,
             "decode",
+            server_args,
         )
         stop_profile(
             profiler,
@@ -1767,8 +1802,6 @@ def latency_test_run_once(
             trace_filename=trace_filename,
             stage="decode",
         )
-
-    trace_mark("phase_transition/DECODE_DONE", profile_owner)
 
     measurement_results["executed_decode_steps"] = len(decode_process_latencies)
     if decode_profile_plan.enabled:
@@ -1992,7 +2025,9 @@ def latency_test(
             log_decode_step=0,
             profile=False,
             profile_record_shapes=False,
+            profile_with_stack=False,
             profile_activities=("CPU", "GPU"),
+            profile_output_dir=None,
             profile_filename_prefix="",
             profile_stage="all",
             tp_rank=tp_rank,
@@ -2057,7 +2092,9 @@ def latency_test(
                 bench_args.log_decode_step,
                 bench_args.profile,
                 bench_args.profile_record_shapes if tp_rank == 0 else None,
+                bench_args.profile_with_stack,
                 bench_args.profile_activities,
+                bench_args.profile_output_dir,
                 bench_args.profile_filename_prefix,
                 bench_args.profile_stage,
                 tp_rank,
@@ -2121,7 +2158,9 @@ def wait_for_workers(workers):
 
 
 def main(server_args, bench_args):
-    server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+    server_args.cuda_graph_max_bs = resolve_one_batch_cuda_graph_max_bs(
+        server_args.cuda_graph_max_bs, bench_args.batch_size
+    )
 
     _set_envs_and_config(server_args)
 

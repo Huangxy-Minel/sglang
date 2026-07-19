@@ -874,7 +874,6 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
-        self.hisparse_host_only = False
 
     @property
     def seqlen(self) -> int:

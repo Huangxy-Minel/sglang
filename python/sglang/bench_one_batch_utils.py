@@ -6,9 +6,9 @@ chunk, and metric calculations can be unit tested on CPU-only machines.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass, fields as dataclass_fields
-from typing import Any, Optional, Sequence
+from pathlib import Path
+from typing import Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -39,10 +39,6 @@ class DecodeProfilePlan:
     @property
     def profiled_steps(self) -> int:
         return self.end_step - self.start_step if self.enabled else 0
-
-    @property
-    def executed_steps_after_capture(self) -> int:
-        return self.end_step if self.enabled and self.exit_after_capture else 0
 
     def action_for_step(self, step: int) -> DecodeProfileStepAction:
         in_window = self.enabled and self.start_step <= step < self.end_step
@@ -120,22 +116,35 @@ def normalize_profile_activities(
     return tuple(activities)
 
 
-@contextmanager
-def disable_cuda_graph_replay(model_runner: Any, enabled: bool):
-    """Temporarily make both SGLang CUDA graph runners unavailable."""
-    if not enabled:
-        yield
-        return
+def resolve_one_batch_cuda_graph_max_bs(
+    configured_max_bs: Optional[int], batch_sizes: Sequence[int]
+) -> int:
+    """Preserve an explicit graph limit and infer one only when absent."""
+    if configured_max_bs is not None:
+        return configured_max_bs
+    if not batch_sizes:
+        raise ValueError("batch_sizes must not be empty")
+    return max(batch_sizes)
 
-    graph_runner = model_runner.graph_runner
-    piecewise_graph_runner = model_runner.piecewise_cuda_graph_runner
-    model_runner.graph_runner = None
-    model_runner.piecewise_cuda_graph_runner = None
-    try:
-        yield
-    finally:
-        model_runner.graph_runner = graph_runner
-        model_runner.piecewise_cuda_graph_runner = piecewise_graph_runner
+
+def build_profile_trace_filename(
+    *,
+    output_dir: str,
+    prefix: str,
+    batch_size: int,
+    input_len: int,
+    output_len: int,
+    stage: str,
+    tp_size: int,
+    dp_size: int,
+    ep_size: int,
+) -> str:
+    """Build a trace name from the admitted batch and runtime topology."""
+    filename = (
+        f"{prefix}_tp{tp_size}_dp{dp_size}_ep{ep_size}_batch{batch_size}_"
+        f"input{input_len}_output{output_len}_{stage}.trace.json.gz"
+    )
+    return str(Path(output_dir) / filename)
 
 
 def build_decode_profile_plan(

@@ -2,7 +2,6 @@
 
 import importlib.util
 import sys
-import types
 import unittest
 from pathlib import Path
 
@@ -156,36 +155,6 @@ class TestDecodeProfilePlan(unittest.TestCase):
             ("CPU", "GPU"),
         )
 
-    def test_force_eager_temporarily_disables_graph_runners(self):
-        graph_runner = object()
-        piecewise_graph_runner = object()
-        runner = types.SimpleNamespace(
-            graph_runner=graph_runner,
-            piecewise_cuda_graph_runner=piecewise_graph_runner,
-        )
-
-        with bench_utils.disable_cuda_graph_replay(runner, enabled=True):
-            self.assertIsNone(runner.graph_runner)
-            self.assertIsNone(runner.piecewise_cuda_graph_runner)
-
-        self.assertIs(runner.graph_runner, graph_runner)
-        self.assertIs(runner.piecewise_cuda_graph_runner, piecewise_graph_runner)
-
-    def test_force_eager_restores_graph_runners_after_failure(self):
-        graph_runner = object()
-        piecewise_graph_runner = object()
-        runner = types.SimpleNamespace(
-            graph_runner=graph_runner,
-            piecewise_cuda_graph_runner=piecewise_graph_runner,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "boom"):
-            with bench_utils.disable_cuda_graph_replay(runner, enabled=True):
-                raise RuntimeError("boom")
-
-        self.assertIs(runner.graph_runner, graph_runner)
-        self.assertIs(runner.piecewise_cuda_graph_runner, piecewise_graph_runner)
-
     def test_profile_window_skips_16_steps_then_profiles_8(self):
         plan = bench_utils.build_decode_profile_plan(
             output_len=128,
@@ -203,9 +172,34 @@ class TestDecodeProfilePlan(unittest.TestCase):
         self.assertTrue(plan.action_for_step(23).force_eager)
         self.assertTrue(plan.action_for_step(23).exit_after_step)
         self.assertFalse(plan.action_for_step(24).profile)
-        self.assertEqual(plan.executed_steps_after_capture, 24)
         self.assertEqual(plan.profiled_steps, 8)
         self.assertEqual(plan.execution_mode, "eager")
+
+    def test_explicit_cuda_graph_limit_is_preserved(self):
+        self.assertEqual(
+            bench_utils.resolve_one_batch_cuda_graph_max_bs(32, (128,)), 32
+        )
+
+    def test_missing_cuda_graph_limit_uses_requested_batch(self):
+        self.assertEqual(
+            bench_utils.resolve_one_batch_cuda_graph_max_bs(None, (16, 64)), 64
+        )
+
+    def test_profile_trace_filename_uses_admitted_batch_and_parallelism(self):
+        self.assertEqual(
+            bench_utils.build_profile_trace_filename(
+                output_dir="/tmp/traces",
+                prefix="glm51",
+                batch_size=7,
+                input_len=32768,
+                output_len=128,
+                stage="decode",
+                tp_size=16,
+                dp_size=16,
+                ep_size=16,
+            ),
+            "/tmp/traces/glm51_tp16_dp16_ep16_batch7_input32768_output128_decode.trace.json.gz",
+        )
 
     def test_runtime_mode_profiles_the_same_window_without_forcing_eager(self):
         plan = bench_utils.build_decode_profile_plan(
