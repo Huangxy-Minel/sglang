@@ -463,11 +463,10 @@ def evaluate_hisparse_wave_admission(
     if snapshot.request_slots_available < 1:
         return decision(False, "request_pool")
 
-    virtual_hot_available = min(
-        snapshot.hot_available,
-        snapshot.hot_total - ready_count * hot_per_ready_request,
-    )
-    if virtual_hot_available < requirements.hot_prefill_peak:
+    # One-batch keeps completed requests host-only until all prefill waves are
+    # done. Their decode buffers are hydrated together immediately before
+    # decode, so they do not consume hot slots during the next prefill wave.
+    if snapshot.hot_available < requirements.hot_prefill_peak:
         return decision(False, "hot_prefill_peak")
     if snapshot.hot_total < (ready_count + 1) * hot_per_ready_request:
         return decision(False, "hot_decode_reserve")

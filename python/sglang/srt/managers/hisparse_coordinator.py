@@ -190,6 +190,8 @@ class HiSparseCoordinator:
             ] = -1
 
         req.staging = False
+        req.hisparse_staging = False
+        req.hisparse_host_only = False
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
@@ -248,10 +250,9 @@ class HiSparseCoordinator:
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
-    def collect_ready_reqs(self) -> List[Req]:
-        ready_reqs = []
+    def _pop_finished_staging_reqs(self) -> List[Req]:
         if len(self.ack_staging_queue) == 0:
-            return ready_reqs
+            return []
 
         finish_count = 0
         for _, finish_event, _ in self.ack_staging_queue:
@@ -267,15 +268,48 @@ class HiSparseCoordinator:
                 group=self.tp_group,
             )
         finish_count = int(queue_size.item())
+        finished_reqs = []
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
+            finished_reqs.append(req)
+            finish_count -= 1
+        return finished_reqs
+
+    def collect_ready_reqs(self) -> List[Req]:
+        ready_reqs = []
+        for req in self._pop_finished_staging_reqs():
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             req.hisparse_staging = False
+            req.hisparse_host_only = False
             self._skip_first_backup[req.req_pool_idx] = True
-            finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
+
+    def collect_host_ready_reqs(self) -> List[Req]:
+        """Finish staging without retaining a decode buffer on device.
+
+        Static one-batch prefill uses this path so completed requests do not
+        reduce the hot capacity available to the next long-prefill wave. The
+        caller must invoke ``admit_request_direct`` for every returned request
+        before building the decode batch.
+        """
+        host_ready_reqs = []
+        for req in self._pop_finished_staging_reqs():
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.kv_allocated_len
+            ]
+            mapping = (
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+            )
+            device_indices = mapping[allocated_locs]
+            mapping[allocated_locs] = 0
+            self.token_to_kv_pool_allocator.free_hisparse_indices(device_indices)
+
+            req.hisparse_staging = False
+            req.hisparse_host_only = True
+            host_ready_reqs.append(req)
+        return host_ready_reqs
 
     def _grow_device_buffers(
         self,
@@ -558,6 +592,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
+        req.hisparse_host_only = False
 
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
@@ -594,6 +629,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        req.hisparse_host_only = False
 
     def swap_in_selected_pages(
         self,

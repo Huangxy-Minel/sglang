@@ -682,14 +682,9 @@ class _TorchBenchRunner:
                 cluster_snapshot.device_available,
             )
         elif reason == "hot_prefill_peak":
-            hot_per_req = admission.requirements.hot_per_ready_request
-            local_value = min(
+            local_value, cluster_value = (
                 local_snapshot.hot_available,
-                local_snapshot.hot_total - ready_count * hot_per_req,
-            )
-            cluster_value = min(
                 cluster_snapshot.hot_available,
-                cluster_snapshot.hot_total - ready_count * hot_per_req,
             )
         elif reason == "hot_decode_reserve":
             local_value, cluster_value = (
@@ -911,7 +906,7 @@ class _TorchBenchRunner:
                     ):
                         coordinator.admit_request_into_staging(req)
                         coordinator.write_staging_stream.synchronize()
-                        wave_ready_reqs = coordinator.collect_ready_reqs()
+                        wave_ready_reqs = coordinator.collect_host_ready_reqs()
                         self.synchronize()
                     staging_latency += time.perf_counter() - staging_tic
                     if len(wave_ready_reqs) != 1 or wave_ready_reqs[0] is not req:
@@ -966,6 +961,14 @@ class _TorchBenchRunner:
                     "KV capacity rejected the first prefill wave: "
                     f"reason={stop_reason}, snapshot={capacity_snapshots[-1]}"
                 )
+
+            if self.is_hisparse:
+                control_tic = time.perf_counter()
+                with trace_range("hisparse/hydrate_decode_batch", trace_enabled):
+                    for req in ready_reqs:
+                        coordinator.admit_request_direct(req)
+                    self.synchronize()
+                control_latency += time.perf_counter() - control_tic
 
             batch = self._build_decode_batch(ready_reqs)
             self._active_batch = batch
@@ -1033,7 +1036,10 @@ class _TorchBenchRunner:
             coordinator = runner.hisparse_coordinator
             if req.hisparse_staging:
                 coordinator.abort_staging_request(req)
-            elif int(coordinator.req_device_buffer_size[req.req_pool_idx]) > 0:
+            elif (
+                req.hisparse_host_only
+                or int(coordinator.req_device_buffer_size[req.req_pool_idx]) > 0
+            ):
                 coordinator.request_finished(req)
 
         allocator.free(allocated_locs)

@@ -499,6 +499,30 @@ class TestHiSparseWaveCapacity(unittest.TestCase):
         self.assertFalse(decision.can_admit)
         self.assertEqual(decision.stop_reason, "hot_decode_reserve")
 
+    def test_deferred_hydration_reaches_decode_capacity_after_long_prefill(self):
+        snapshot = self._snapshot(
+            hot_total=37056,
+            hot_available=37056,
+            max_context_len=65536,
+        )
+        ready_count = 0
+        while True:
+            decision = bench_utils.evaluate_hisparse_wave_admission(
+                snapshot=snapshot,
+                ready_count=ready_count,
+                requested_batch_size=128,
+                input_len=32768,
+                output_len=8192,
+                page_size=64,
+                device_buffer_size=4096,
+            )
+            if not decision.can_admit:
+                break
+            ready_count += 1
+
+        self.assertEqual(ready_count, 8)
+        self.assertEqual(decision.stop_reason, "hot_decode_reserve")
+
     def test_logical_host_request_and_context_failures_are_distinct(self):
         common = dict(
             ready_count=1,
