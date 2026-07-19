@@ -47,6 +47,21 @@ class HiSparseAdmissionDecision:
     requirements: HiSparseCapacityRequirements
 
 
+@dataclass(frozen=True)
+class DeviceCapacitySnapshot:
+    device_total: int
+    device_available: int
+    request_slots_available: int
+    max_context_len: int
+
+
+@dataclass(frozen=True)
+class DeviceAdmissionDecision:
+    can_admit: bool
+    stop_reason: str
+    required_tokens: int
+
+
 def build_deepep_micro_warmup_shape(
     moe_a2a_backend: str,
     deepep_mode: str,
@@ -154,7 +169,7 @@ def build_chunk_plan(
     )
 
 
-def build_hisparse_wave_chunk_plan(
+def build_wave_chunk_plan(
     input_len: int,
     requested_chunk_size: Optional[int],
     effective_chunk_size: Optional[int],
@@ -183,6 +198,50 @@ def seed_for_attention_dp_group(random_seed: int, attention_dp_rank: int) -> int
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def evaluate_device_wave_admission(
+    snapshot: DeviceCapacitySnapshot,
+    ready_count: int,
+    requested_batch_size: int,
+    input_len: int,
+    output_len: int,
+    page_size: int,
+) -> DeviceAdmissionDecision:
+    """Check whether a device-only KV pool can admit the next request wave.
+
+    The current free count already excludes the input KV of ready requests. The
+    additional requirement reserves their remaining decode growth plus the
+    complete input/output lifetime of the request in the next wave.
+    """
+    if ready_count < 0:
+        raise ValueError("ready_count must be non-negative")
+    if requested_batch_size <= 0:
+        raise ValueError("requested_batch_size must be positive")
+    if input_len <= 0 or output_len <= 0:
+        raise ValueError("input_len and output_len must be positive")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    aligned_input_len = _align_up(input_len, page_size)
+    aligned_full_len = _align_up(input_len + output_len, page_size)
+    next_request_peak = max(aligned_full_len, input_len + page_size)
+    required_tokens = (
+        ready_count * (aligned_full_len - aligned_input_len) + next_request_peak
+    )
+
+    def decision(can_admit: bool, reason: str) -> DeviceAdmissionDecision:
+        return DeviceAdmissionDecision(can_admit, reason, required_tokens)
+
+    if ready_count >= requested_batch_size:
+        return decision(False, "target_reached")
+    if input_len + output_len > snapshot.max_context_len:
+        return decision(False, "max_context_len")
+    if snapshot.request_slots_available < 1:
+        return decision(False, "request_pool")
+    if snapshot.device_available < required_tokens:
+        return decision(False, "device_pool")
+    return decision(True, "admitted")
 
 
 def evaluate_hisparse_wave_admission(

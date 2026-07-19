@@ -66,11 +66,13 @@ import torch.distributed as dist
 
 from sglang.bench_one_batch_utils import (
     ChunkPlan,
+    DeviceCapacitySnapshot,
     HiSparseCapacitySnapshot,
     build_chunk_plan,
     build_cluster_metrics,
     build_deepep_micro_warmup_shape,
-    build_hisparse_wave_chunk_plan,
+    build_wave_chunk_plan,
+    evaluate_device_wave_admission,
     evaluate_hisparse_wave_admission,
     get_local_rank_assignments,
     prepare_chunk_requests,
@@ -539,7 +541,7 @@ class _TorchBenchRunner:
 
     def __init__(self, model_runner):
         self.torch_runner = model_runner
-        self._active_hisparse_batch = None
+        self._active_batch = None
 
     def clear(self):
         if self.is_hisparse:
@@ -606,8 +608,23 @@ class _TorchBenchRunner:
             max_context_len=self.torch_runner.req_to_token_pool.max_context_len,
         )
 
-    def _cluster_min_capacity_snapshot(self) -> HiSparseCapacitySnapshot:
-        snapshot = self._hisparse_capacity_snapshot()
+    def _device_capacity_snapshot(self) -> DeviceCapacitySnapshot:
+        allocator = self.torch_runner.token_to_kv_pool_allocator
+        return DeviceCapacitySnapshot(
+            device_total=allocator.size,
+            device_available=allocator.available_size(),
+            request_slots_available=(
+                self.torch_runner.req_to_token_pool.available_size()
+            ),
+            max_context_len=self.torch_runner.req_to_token_pool.max_context_len,
+        )
+
+    def _capacity_snapshot(self):
+        if self.is_hisparse:
+            return self._hisparse_capacity_snapshot()
+        return self._device_capacity_snapshot()
+
+    def _cluster_min_capacity_snapshot(self, snapshot):
         names = [field.name for field in dataclasses.fields(snapshot)]
         values = [getattr(snapshot, name) for name in names]
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -621,12 +638,12 @@ class _TorchBenchRunner:
                 group=get_tp_group().cpu_group,
             )
             values = tensor.tolist()
-        return HiSparseCapacitySnapshot(**dict(zip(names, values)))
+        return type(snapshot)(**dict(zip(names, values)))
 
     def _cluster_limiting_rank(
         self,
-        local_snapshot: HiSparseCapacitySnapshot,
-        cluster_snapshot: HiSparseCapacitySnapshot,
+        local_snapshot,
+        cluster_snapshot,
         admission,
         ready_count: int,
     ) -> Optional[int]:
@@ -634,7 +651,12 @@ class _TorchBenchRunner:
             return None
 
         reason = admission.stop_reason
-        if reason == "hot_prefill_peak":
+        if reason == "device_pool":
+            local_value, cluster_value = (
+                local_snapshot.device_available,
+                cluster_snapshot.device_available,
+            )
+        elif reason == "hot_prefill_peak":
             hot_per_req = admission.requirements.hot_per_ready_request
             local_value = min(
                 local_snapshot.hot_available,
@@ -687,9 +709,8 @@ class _TorchBenchRunner:
         )
         return int(candidate_tensor.item())
 
-    def _build_hisparse_decode_batch(self, reqs):
+    def _build_decode_batch(self, reqs):
         runner = self.torch_runner
-        coordinator = runner.hisparse_coordinator
         tree_cache = TreeCacheNamespace(
             page_size=runner.server_args.page_size,
             device=runner.device,
@@ -729,10 +750,11 @@ class _TorchBenchRunner:
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, runner.model_config.vocab_size
         )
-        batch.hisparse_coordinator = coordinator
+        if self.is_hisparse:
+            batch.hisparse_coordinator = runner.hisparse_coordinator
         return batch
 
-    def prefill_hisparse_waves(
+    def prefill_waves(
         self,
         reqs,
         requested_batch_size,
@@ -742,16 +764,15 @@ class _TorchBenchRunner:
         effective_chunk_size,
         trace_enabled,
     ):
-        if not self.is_hisparse:
-            raise RuntimeError("HiSparse wave prefill requires --enable-hisparse")
-
-        chunk_plan = build_hisparse_wave_chunk_plan(
+        chunk_plan = build_wave_chunk_plan(
             input_len=input_len,
             requested_chunk_size=requested_chunk_size,
             effective_chunk_size=effective_chunk_size,
             page_size=self.page_size,
         )
-        coordinator = self.torch_runner.hisparse_coordinator
+        coordinator = (
+            self.torch_runner.hisparse_coordinator if self.is_hisparse else None
+        )
         ready_reqs = []
         capacity_snapshots = []
         prefill_compute_latency = 0.0
@@ -762,17 +783,29 @@ class _TorchBenchRunner:
         try:
             while len(ready_reqs) < requested_batch_size:
                 control_tic = time.perf_counter()
-                local_snapshot = self._hisparse_capacity_snapshot()
-                cluster_snapshot = self._cluster_min_capacity_snapshot()
-                admission = evaluate_hisparse_wave_admission(
-                    snapshot=cluster_snapshot,
-                    ready_count=len(ready_reqs),
-                    requested_batch_size=requested_batch_size,
-                    input_len=input_len,
-                    output_len=output_len,
-                    page_size=self.page_size,
-                    device_buffer_size=coordinator.device_buffer_size,
-                )
+                local_snapshot = self._capacity_snapshot()
+                cluster_snapshot = self._cluster_min_capacity_snapshot(local_snapshot)
+                if self.is_hisparse:
+                    admission = evaluate_hisparse_wave_admission(
+                        snapshot=cluster_snapshot,
+                        ready_count=len(ready_reqs),
+                        requested_batch_size=requested_batch_size,
+                        input_len=input_len,
+                        output_len=output_len,
+                        page_size=self.page_size,
+                        device_buffer_size=coordinator.device_buffer_size,
+                    )
+                    requirements = dataclasses.asdict(admission.requirements)
+                else:
+                    admission = evaluate_device_wave_admission(
+                        snapshot=cluster_snapshot,
+                        ready_count=len(ready_reqs),
+                        requested_batch_size=requested_batch_size,
+                        input_len=input_len,
+                        output_len=output_len,
+                        page_size=self.page_size,
+                    )
+                    requirements = {"required_tokens": admission.required_tokens}
                 limiting_rank = self._cluster_limiting_rank(
                     local_snapshot,
                     cluster_snapshot,
@@ -785,7 +818,7 @@ class _TorchBenchRunner:
                         "wave": len(ready_reqs),
                         "ready_count": len(ready_reqs),
                         **dataclasses.asdict(cluster_snapshot),
-                        "requirements": dataclasses.asdict(admission.requirements),
+                        "requirements": requirements,
                         "decision": admission.stop_reason,
                         "limiting_rank": limiting_rank,
                     }
@@ -808,21 +841,26 @@ class _TorchBenchRunner:
                 prefill_compute_latency += time.perf_counter() - compute_tic
                 req.output_ids.append(int(next_token_ids[0].item()))
 
-                self.synchronize()
-                staging_tic = time.perf_counter()
-                with trace_range(
-                    f"hisparse/staging/wave_{wave_index}", trace_enabled
-                ):
-                    coordinator.admit_request_into_staging(req)
-                    coordinator.write_staging_stream.synchronize()
-                    wave_ready_reqs = coordinator.collect_ready_reqs()
+                if self.is_hisparse:
+                    # Stage once after all chunks of this request have completed.
                     self.synchronize()
-                staging_latency += time.perf_counter() - staging_tic
-                if len(wave_ready_reqs) != 1 or wave_ready_reqs[0] is not req:
-                    raise RuntimeError(
-                        "HiSparse one-batch expected exactly one ready request per "
-                        f"wave, got {[ready_req.rid for ready_req in wave_ready_reqs]}"
-                    )
+                    staging_tic = time.perf_counter()
+                    with trace_range(
+                        f"hisparse/staging/wave_{wave_index}", trace_enabled
+                    ):
+                        coordinator.admit_request_into_staging(req)
+                        coordinator.write_staging_stream.synchronize()
+                        wave_ready_reqs = coordinator.collect_ready_reqs()
+                        self.synchronize()
+                    staging_latency += time.perf_counter() - staging_tic
+                    if len(wave_ready_reqs) != 1 or wave_ready_reqs[0] is not req:
+                        raise RuntimeError(
+                            "HiSparse one-batch expected exactly one ready request per "
+                            "wave, got "
+                            f"{[ready_req.rid for ready_req in wave_ready_reqs]}"
+                        )
+                else:
+                    wave_ready_reqs = [req]
                 ready_reqs.extend(wave_ready_reqs)
 
                 control_tic = time.perf_counter()
@@ -831,16 +869,16 @@ class _TorchBenchRunner:
 
             if not ready_reqs:
                 raise RuntimeError(
-                    "HiSparse capacity rejected the first prefill wave: "
+                    "KV capacity rejected the first prefill wave: "
                     f"reason={stop_reason}, snapshot={capacity_snapshots[-1]}"
                 )
 
-            batch = self._build_hisparse_decode_batch(ready_reqs)
-            self._active_hisparse_batch = batch
+            batch = self._build_decode_batch(ready_reqs)
+            self._active_batch = batch
         except Exception:
             for req in reqs:
-                self._release_hisparse_request(req)
-            self._active_hisparse_batch = None
+                self._release_request(req)
+            self._active_batch = None
             raise
         return batch.output_ids.clone(), batch, {
             "requested_batch_size": requested_batch_size,
@@ -857,67 +895,79 @@ class _TorchBenchRunner:
     def decode(self, next_token_ids, batch):
         return decode(next_token_ids, batch, self.torch_runner)
 
-    def _release_hisparse_request(self, req):
+    def _release_request(self, req):
         if req.req_pool_idx is None:
             return
 
         runner = self.torch_runner
-        coordinator = runner.hisparse_coordinator
         allocator = runner.token_to_kv_pool_allocator
         allocated_locs = runner.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ].clone()
 
-        if req.hisparse_staging:
-            coordinator.abort_staging_request(req)
-        elif int(coordinator.req_device_buffer_size[req.req_pool_idx]) > 0:
-            coordinator.request_finished(req)
+        if self.is_hisparse:
+            coordinator = runner.hisparse_coordinator
+            if req.hisparse_staging:
+                coordinator.abort_staging_request(req)
+            elif int(coordinator.req_device_buffer_size[req.req_pool_idx]) > 0:
+                coordinator.request_finished(req)
 
         allocator.free(allocated_locs)
         runner.req_to_token_pool.free(req)
 
-    def _assert_hisparse_pools_restored(self):
+    def _assert_pools_restored(self):
         runner = self.torch_runner
-        coordinator = runner.hisparse_coordinator
         allocator = runner.token_to_kv_pool_allocator
         if (
             runner.req_to_token_pool.available_size()
             != runner.req_to_token_pool.size
         ):
-            raise RuntimeError("HiSparse request pool leaked after one-batch cleanup")
-        if coordinator.ack_staging_queue:
-            raise RuntimeError("HiSparse staging queue was not drained during cleanup")
-        if (
-            coordinator.mem_pool_host.available_size()
-            != coordinator.mem_pool_host.size
-        ):
-            raise RuntimeError("HiSparse host KV pool leaked after one-batch cleanup")
-        if (
-            allocator.logical_attn_allocator.available_size()
-            != allocator.logical_attn_allocator.size
-        ):
-            raise RuntimeError("HiSparse logical KV pool leaked after one-batch cleanup")
-        if (
-            allocator.hisparse_attn_allocator.available_size()
-            != allocator.hisparse_attn_allocator.size
-        ):
-            raise RuntimeError("HiSparse hot KV pool leaked after one-batch cleanup")
+            raise RuntimeError("request pool leaked after one-batch cleanup")
+        if self.is_hisparse:
+            coordinator = runner.hisparse_coordinator
+            if coordinator.ack_staging_queue:
+                raise RuntimeError(
+                    "HiSparse staging queue was not drained during cleanup"
+                )
+            if (
+                coordinator.mem_pool_host.available_size()
+                != coordinator.mem_pool_host.size
+            ):
+                raise RuntimeError(
+                    "HiSparse host KV pool leaked after one-batch cleanup"
+                )
+            if (
+                allocator.logical_attn_allocator.available_size()
+                != allocator.logical_attn_allocator.size
+            ):
+                raise RuntimeError(
+                    "HiSparse logical KV pool leaked after one-batch cleanup"
+                )
+            if (
+                allocator.hisparse_attn_allocator.available_size()
+                != allocator.hisparse_attn_allocator.size
+            ):
+                raise RuntimeError(
+                    "HiSparse hot KV pool leaked after one-batch cleanup"
+                )
+        elif allocator.available_size() != allocator.size:
+            raise RuntimeError("device KV pool leaked after one-batch cleanup")
 
     def cleanup(self, batch):
-        if not self.is_hisparse or batch is None:
+        if batch is None:
             return
 
         try:
             for req in batch.reqs:
-                self._release_hisparse_request(req)
-            self._assert_hisparse_pools_restored()
+                self._release_request(req)
+            self._assert_pools_restored()
         finally:
-            if batch is self._active_hisparse_batch:
-                self._active_hisparse_batch = None
+            if batch is self._active_batch:
+                self._active_batch = None
 
-    def cleanup_active_hisparse_batch(self):
-        if self._active_hisparse_batch is not None:
-            self.cleanup(self._active_hisparse_batch)
+    def cleanup_active_batch(self):
+        if self._active_batch is not None:
+            self.cleanup(self._active_batch)
 
     def synchronize(self):
         synchronize(self.torch_runner.device)
@@ -952,10 +1002,6 @@ class _TorchBenchRunner:
     def page_size(self):
         return self.torch_runner.server_args.page_size
 
-    def max_batch_size(self, input_len, output_len):
-        return self.torch_runner.max_total_num_tokens // (input_len + output_len)
-
-
 class _MlxBenchRunner:
     """Wraps MlxModelRunner for the MLX benchmark path."""
 
@@ -982,6 +1028,9 @@ class _MlxBenchRunner:
             raise ValueError("chunked one-batch prefill is not supported on MLX")
         return self.extend(reqs)
 
+    def prefill_waves(self, *args, **kwargs):
+        raise ValueError("wave one-batch prefill is not supported on MLX")
+
     def decode(self, next_token_ids, req_ids):
         next_token_ids = self.mlx_runner.decode_batch(req_ids)
         return torch.tensor(next_token_ids), None
@@ -991,7 +1040,7 @@ class _MlxBenchRunner:
             for req_id in batch:
                 self.mlx_runner.remove_request(req_id)
 
-    def cleanup_active_hisparse_batch(self):
+    def cleanup_active_batch(self):
         pass
 
     def synchronize(self):
@@ -1009,10 +1058,6 @@ class _MlxBenchRunner:
     @property
     def page_size(self):
         return self.fake_torch_runner.server_args.page_size
-
-    def max_batch_size(self, input_len, output_len):
-        return self.fake_torch_runner.max_total_num_tokens // (input_len + output_len)
-
 
 def _read_prompts_from_file(prompt_file, rank_print):
     """Read custom prompts from the file specified by `--prompt-filename`."""
@@ -1157,33 +1202,18 @@ def latency_test_run_once(
 ):
     requested_batch_size = batch_size
     is_hisparse = getattr(model_runner, "is_hisparse", False)
-    max_batch_size = model_runner.max_batch_size(input_len, output_len)
-    if not is_hisparse and requested_batch_size > max_batch_size:
-        rank_print(
-            f"skipping ({requested_batch_size}, {input_len}, {output_len}) due to max batch size limit"
+    input_lengths = {len(req.fill_ids) for req in reqs}
+    if input_lengths != {input_len}:
+        raise ValueError(
+            "wave one-batch requires equal-length inputs matching "
+            f"--input-len={input_len}, got {sorted(input_lengths)}"
         )
-        return
-
-    if is_hisparse:
-        input_lengths = {len(req.fill_ids) for req in reqs}
-        if input_lengths != {input_len}:
-            raise ValueError(
-                "HiSparse one-batch requires equal-length inputs matching "
-                f"--input-len={input_len}, got {sorted(input_lengths)}"
-            )
-        chunk_plan = build_hisparse_wave_chunk_plan(
-            input_len=input_len,
-            requested_chunk_size=requested_chunked_prefill_size,
-            effective_chunk_size=server_args.chunked_prefill_size,
-            page_size=model_runner.page_size,
-        )
-    else:
-        chunk_plan = build_chunk_plan(
-            input_lengths=[len(req.fill_ids) for req in reqs],
-            requested_chunk_size=requested_chunked_prefill_size,
-            effective_chunk_size=server_args.chunked_prefill_size,
-            page_size=model_runner.page_size,
-        )
+    chunk_plan = build_wave_chunk_plan(
+        input_len=input_len,
+        requested_chunk_size=requested_chunked_prefill_size,
+        effective_chunk_size=server_args.chunked_prefill_size,
+        page_size=model_runner.page_size,
+    )
 
     model_runner.clear()
 
@@ -1237,37 +1267,29 @@ def latency_test_run_once(
     trace_mark("phase/PREFILL_START", bool(profile))
     model_runner.synchronize()
     tic = time.perf_counter()
+    next_token_ids, batch, wave_prefill = model_runner.prefill_waves(
+        reqs=reqs,
+        requested_batch_size=requested_batch_size,
+        input_len=input_len,
+        output_len=output_len,
+        requested_chunk_size=requested_chunked_prefill_size,
+        effective_chunk_size=server_args.chunked_prefill_size,
+        trace_enabled=enable_profile_prefill,
+    )
+    batch_size = wave_prefill["batch_size"]
+    measurement_results.update(
+        {
+            "batch_size": batch_size,
+            "global_batch_size": batch_size * server_args.dp_size,
+            "waves": {
+                key: value
+                for key, value in wave_prefill.items()
+                if key != "chunk_plan"
+            },
+        }
+    )
     if is_hisparse:
-        next_token_ids, batch, hisparse_prefill = (
-            model_runner.prefill_hisparse_waves(
-                reqs=reqs,
-                requested_batch_size=requested_batch_size,
-                input_len=input_len,
-                output_len=output_len,
-                requested_chunk_size=requested_chunked_prefill_size,
-                effective_chunk_size=server_args.chunked_prefill_size,
-                trace_enabled=enable_profile_prefill,
-            )
-        )
-        batch_size = hisparse_prefill["batch_size"]
-        measurement_results.update(
-            {
-                "batch_size": batch_size,
-                "global_batch_size": batch_size * server_args.dp_size,
-                "hisparse_waves": {
-                    key: value
-                    for key, value in hisparse_prefill.items()
-                    if key != "chunk_plan"
-                },
-            }
-        )
-    else:
-        with trace_range("prefill", enable_profile_prefill):
-            next_token_ids, _, batch = model_runner.prefill(
-                reqs,
-                chunk_plan=chunk_plan,
-                trace_enabled=enable_profile_prefill,
-            )
+        measurement_results["hisparse_waves"] = measurement_results["waves"]
     model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
 
@@ -1292,21 +1314,18 @@ def latency_test_run_once(
     # diagnostic reductions do not contaminate kernel timing.
     model_runner.barrier()
     trace_mark("phase_transition/PREFILL_DONE", bool(profile))
-    prefill_phase_values = [prefill_latency]
-    if is_hisparse:
-        local_control_latency = max(
-            0.0,
-            prefill_latency
-            - hisparse_prefill["prefill_compute_latency"]
-            - hisparse_prefill["staging_latency"],
-        )
-        prefill_phase_values.extend(
-            [
-                hisparse_prefill["prefill_compute_latency"],
-                hisparse_prefill["staging_latency"],
-                local_control_latency,
-            ]
-        )
+    local_control_latency = max(
+        0.0,
+        prefill_latency
+        - wave_prefill["prefill_compute_latency"]
+        - wave_prefill["staging_latency"],
+    )
+    prefill_phase_values = [
+        prefill_latency,
+        wave_prefill["prefill_compute_latency"],
+        wave_prefill["staging_latency"],
+        local_control_latency,
+    ]
     cluster_prefill_values = model_runner.values_from_slowest_rank(
         prefill_phase_values
     )
@@ -1319,22 +1338,21 @@ def latency_test_run_once(
     )
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
-    if is_hisparse:
-        measurement_results["prefill_compute_latency"] = cluster_prefill_values[1]
-        measurement_results["staging_latency"] = cluster_prefill_values[2]
-        measurement_results["prefill_control_latency"] = cluster_prefill_values[3]
-        rank_print(
-            "HiSparse prefill. "
-            f"requested decode BS={requested_batch_size}, "
-            f"admitted decode BS={batch_size}, "
-            f"requested global BS={requested_batch_size * server_args.dp_size}, "
-            f"admitted global BS={batch_size * server_args.dp_size}, "
-            f"waves={hisparse_prefill['num_waves']}, "
-            f"stop_reason={hisparse_prefill['stop_reason']}, "
-            f"compute={measurement_results['prefill_compute_latency']:6.5f} s, "
-            f"staging={measurement_results['staging_latency']:6.5f} s, "
-            f"control={measurement_results['prefill_control_latency']:6.5f} s"
-        )
+    measurement_results["prefill_compute_latency"] = cluster_prefill_values[1]
+    measurement_results["staging_latency"] = cluster_prefill_values[2]
+    measurement_results["prefill_control_latency"] = cluster_prefill_values[3]
+    rank_print(
+        "Wave prefill. "
+        f"requested decode BS={requested_batch_size}, "
+        f"admitted decode BS={batch_size}, "
+        f"requested global BS={requested_batch_size * server_args.dp_size}, "
+        f"admitted global BS={batch_size * server_args.dp_size}, "
+        f"waves={wave_prefill['num_waves']}, "
+        f"stop_reason={wave_prefill['stop_reason']}, "
+        f"compute={measurement_results['prefill_compute_latency']:6.5f} s, "
+        f"staging={measurement_results['staging_latency']:6.5f} s, "
+        f"control={measurement_results['prefill_control_latency']:6.5f} s"
+    )
 
     # This second gate makes decode start a distinct cluster-wide phase.
     model_runner.barrier()
@@ -1575,7 +1593,7 @@ def latency_test(
             requested_chunked_prefill_size=bench_args.chunked_prefill_size,
         )
     finally:
-        model_runner.cleanup_active_hisparse_batch()
+        model_runner.cleanup_active_batch()
 
     rank_print("Benchmark ...")
 
@@ -1637,7 +1655,7 @@ def latency_test(
                 bench_args.chunked_prefill_size,
             )
         finally:
-            model_runner.cleanup_active_hisparse_batch()
+            model_runner.cleanup_active_batch()
         if ret is not None:
             result_list.append(ret)
 

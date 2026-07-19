@@ -259,13 +259,13 @@ class TestHiSparseWaveCapacity(unittest.TestCase):
         return bench_utils.HiSparseCapacitySnapshot(**values)
 
     def test_wave_chunk_budget_is_per_dp_group_request(self):
-        dp16 = bench_utils.build_hisparse_wave_chunk_plan(
+        dp16 = bench_utils.build_wave_chunk_plan(
             input_len=32768,
             requested_chunk_size=65536,
             effective_chunk_size=4096,
             page_size=64,
         )
-        dp8 = bench_utils.build_hisparse_wave_chunk_plan(
+        dp8 = bench_utils.build_wave_chunk_plan(
             input_len=32768,
             requested_chunk_size=65536,
             effective_chunk_size=8192,
@@ -380,6 +380,86 @@ class TestHiSparseWaveCapacity(unittest.TestCase):
             bench_utils.seed_for_attention_dp_group(1234, 7),
             bench_utils.seed_for_attention_dp_group(1234, 8),
         )
+
+
+class TestUnifiedWaveCapacity(unittest.TestCase):
+    def test_wave_chunk_plan_gives_the_budget_to_one_request_per_dp_group(self):
+        baseline = bench_utils.build_wave_chunk_plan(
+            input_len=32768,
+            requested_chunk_size=65536,
+            effective_chunk_size=4096,
+            page_size=64,
+        )
+        hisparse = bench_utils.build_wave_chunk_plan(
+            input_len=32768,
+            requested_chunk_size=65536,
+            effective_chunk_size=4096,
+            page_size=64,
+        )
+
+        self.assertEqual(baseline, hisparse)
+        self.assertEqual(baseline.per_request_chunk_size, 4096)
+        self.assertEqual(baseline.num_chunks, 8)
+
+    def test_device_capacity_reserves_output_growth_for_ready_requests(self):
+        snapshot = bench_utils.DeviceCapacitySnapshot(
+            device_total=20000,
+            device_available=4479,
+            request_slots_available=8,
+            max_context_len=32768,
+        )
+        rejected = bench_utils.evaluate_device_wave_admission(
+            snapshot=snapshot,
+            ready_count=2,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+        )
+        admitted = bench_utils.evaluate_device_wave_admission(
+            snapshot=bench_utils.DeviceCapacitySnapshot(
+                device_total=20000,
+                device_available=4480,
+                request_slots_available=8,
+                max_context_len=32768,
+            ),
+            ready_count=2,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+        )
+
+        self.assertFalse(rejected.can_admit)
+        self.assertEqual(rejected.stop_reason, "device_pool")
+        self.assertEqual(rejected.required_tokens, 4480)
+        self.assertTrue(admitted.can_admit)
+
+    def test_device_capacity_reports_non_memory_stop_reasons(self):
+        common = dict(
+            ready_count=0,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+        )
+        cases = [
+            (
+                bench_utils.DeviceCapacitySnapshot(20000, 20000, 0, 32768),
+                "request_pool",
+            ),
+            (
+                bench_utils.DeviceCapacitySnapshot(20000, 20000, 8, 4095),
+                "max_context_len",
+            ),
+        ]
+        for snapshot, reason in cases:
+            with self.subTest(reason=reason):
+                decision = bench_utils.evaluate_device_wave_admission(
+                    snapshot=snapshot, **common
+                )
+                self.assertFalse(decision.can_admit)
+                self.assertEqual(decision.stop_reason, reason)
 
 
 if __name__ == "__main__":
