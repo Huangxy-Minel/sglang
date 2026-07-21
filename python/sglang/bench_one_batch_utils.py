@@ -99,6 +99,8 @@ class DeviceAdmissionDecision:
 class HBMUsageSnapshot:
     total_bytes: int
     free_bytes: int
+    torch_active_bytes: int
+    torch_reserved_bytes: int
     model_bytes: int
     kv_data_bytes: int
     kv_indexer_bytes: int
@@ -243,7 +245,7 @@ def split_kv_pool_bytes(total_bytes: int, indexer_bytes: int) -> dict[str, int]:
 
 
 def build_hbm_usage(snapshot: HBMUsageSnapshot) -> dict[str, int]:
-    """Build a non-overlapping per-GPU HBM ledger."""
+    """Build a non-overlapping per-GPU HBM capacity ledger."""
     values = {
         field.name: getattr(snapshot, field.name)
         for field in dataclass_fields(HBMUsageSnapshot)
@@ -254,22 +256,36 @@ def build_hbm_usage(snapshot: HBMUsageSnapshot) -> dict[str, int]:
         raise ValueError("free HBM cannot exceed total HBM")
 
     used_bytes = snapshot.total_bytes - snapshot.free_bytes
-    known_used_bytes = (
+    if snapshot.torch_active_bytes > snapshot.torch_reserved_bytes:
+        raise ValueError("PyTorch active HBM cannot exceed reserved HBM")
+    if snapshot.torch_reserved_bytes > used_bytes:
+        raise ValueError("PyTorch reserved HBM cannot exceed driver-used HBM")
+
+    known_active_bytes = (
         snapshot.model_bytes
         + snapshot.kv_data_bytes
         + snapshot.kv_indexer_bytes
-        + snapshot.cuda_graph_bytes
     )
-    if known_used_bytes > used_bytes:
+    if known_active_bytes > snapshot.torch_active_bytes:
         raise ValueError(
-            "known HBM categories exceed actual used HBM: "
-            f"known={known_used_bytes}, used={used_bytes}"
+            "known active HBM categories exceed PyTorch active HBM: "
+            f"known={known_active_bytes}, active={snapshot.torch_active_bytes}"
         )
+
+    torch_active_other_bytes = snapshot.torch_active_bytes - known_active_bytes
+    torch_inactive_cache_bytes = (
+        snapshot.torch_reserved_bytes - snapshot.torch_active_bytes
+    )
+    native_external_bytes = used_bytes - snapshot.torch_reserved_bytes
+    effective_available_bytes = snapshot.free_bytes + torch_inactive_cache_bytes
 
     return {
         **values,
         "used_bytes": used_bytes,
-        "other_bytes": used_bytes - known_used_bytes,
+        "torch_active_other_bytes": torch_active_other_bytes,
+        "torch_inactive_cache_bytes": torch_inactive_cache_bytes,
+        "native_external_bytes": native_external_bytes,
+        "effective_available_bytes": effective_available_bytes,
     }
 
 

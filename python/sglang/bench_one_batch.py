@@ -1162,6 +1162,7 @@ class _TorchBenchRunner:
 
     def _hbm_usage_snapshot(self) -> HBMUsageSnapshot:
         runner = self.torch_runner
+        torch.cuda.synchronize(runner.gpu_id)
         free_bytes, total_bytes = torch.cuda.mem_get_info(runner.gpu_id)
 
         model_tensors = list(runner.model.parameters()) + list(
@@ -1187,6 +1188,8 @@ class _TorchBenchRunner:
         return HBMUsageSnapshot(
             total_bytes=total_bytes,
             free_bytes=free_bytes,
+            torch_active_bytes=torch.cuda.memory_allocated(runner.gpu_id),
+            torch_reserved_bytes=torch.cuda.memory_reserved(runner.gpu_id),
             model_bytes=model_bytes,
             kv_data_bytes=kv_usage["kv_data_bytes"],
             kv_indexer_bytes=kv_usage["kv_indexer_bytes"],
@@ -1473,15 +1476,23 @@ def print_hbm_usage_report(summary, rank_print):
     format_row("Model", "model_bytes")
     format_row("KV data pool", "kv_data_bytes")
     format_row("KV indexer pool", "kv_indexer_bytes")
-    format_row("CUDA Graph", "cuda_graph_bytes")
-    format_row("Other (DeepEP/NCCL/runtime)", "other_bytes")
+    format_row("PyTorch active other", "torch_active_other_bytes")
+    format_row("Native/external allocations", "native_external_bytes")
     format_row(
-        "DeepEP configured buffers (in Other)",
+        "DeepEP configured buffers (subset)",
         "deepep_configured_bytes",
         indent="  ",
     )
-    format_row("Free", "free_bytes")
+    format_row("Available capacity", "effective_available_bytes")
+    format_row("Driver free", "free_bytes", indent="  ")
+    format_row(
+        "PyTorch inactive cache",
+        "torch_inactive_cache_bytes",
+        indent="  ",
+    )
     format_row("Total", "total_bytes")
+    rank_print("CUDA Graph capture delta (non-additive)")
+    format_row("Driver-used delta", "cuda_graph_bytes", indent="  ")
     rank_print("========================")
 
 

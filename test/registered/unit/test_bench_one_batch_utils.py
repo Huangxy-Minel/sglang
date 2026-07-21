@@ -369,11 +369,13 @@ class TestClusterMetrics(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "indexer KV storage"):
             bench_utils.split_kv_pool_bytes(100, 101)
 
-    def test_hbm_usage_uses_a_non_overlapping_residual_ledger(self):
+    def test_hbm_usage_separates_reclaimable_cache_from_active_memory(self):
         usage = bench_utils.build_hbm_usage(
             bench_utils.HBMUsageSnapshot(
                 total_bytes=1000,
                 free_bytes=100,
+                torch_active_bytes=700,
+                torch_reserved_bytes=800,
                 model_bytes=400,
                 kv_data_bytes=200,
                 kv_indexer_bytes=50,
@@ -383,24 +385,29 @@ class TestClusterMetrics(unittest.TestCase):
         )
 
         self.assertEqual(usage["used_bytes"], 900)
-        self.assertEqual(usage["other_bytes"], 150)
+        self.assertEqual(usage["torch_active_other_bytes"], 50)
+        self.assertEqual(usage["torch_inactive_cache_bytes"], 100)
+        self.assertEqual(usage["native_external_bytes"], 100)
+        self.assertEqual(usage["effective_available_bytes"], 200)
         self.assertEqual(usage["deepep_configured_bytes"], 80)
         self.assertEqual(
             usage["model_bytes"]
             + usage["kv_data_bytes"]
             + usage["kv_indexer_bytes"]
-            + usage["cuda_graph_bytes"]
-            + usage["other_bytes"]
-            + usage["free_bytes"],
+            + usage["torch_active_other_bytes"]
+            + usage["native_external_bytes"]
+            + usage["effective_available_bytes"],
             usage["total_bytes"],
         )
 
     def test_hbm_usage_rejects_impossible_accounting(self):
-        with self.assertRaisesRegex(ValueError, "known HBM categories"):
+        with self.assertRaisesRegex(ValueError, "known active HBM"):
             bench_utils.build_hbm_usage(
                 bench_utils.HBMUsageSnapshot(
                     total_bytes=1000,
                     free_bytes=100,
+                    torch_active_bytes=700,
+                    torch_reserved_bytes=800,
                     model_bytes=700,
                     kv_data_bytes=200,
                     kv_indexer_bytes=50,
@@ -414,6 +421,8 @@ class TestClusterMetrics(unittest.TestCase):
                 bench_utils.HBMUsageSnapshot(
                     total_bytes=1000,
                     free_bytes=100,
+                    torch_active_bytes=700,
+                    torch_reserved_bytes=800,
                     model_bytes=400,
                     kv_data_bytes=200,
                     kv_indexer_bytes=50,
@@ -423,6 +432,8 @@ class TestClusterMetrics(unittest.TestCase):
                 bench_utils.HBMUsageSnapshot(
                     total_bytes=1000,
                     free_bytes=80,
+                    torch_active_bytes=710,
+                    torch_reserved_bytes=820,
                     model_bytes=400,
                     kv_data_bytes=200,
                     kv_indexer_bytes=50,
@@ -435,7 +446,12 @@ class TestClusterMetrics(unittest.TestCase):
         self.assertEqual(summary["num_ranks"], 2)
         self.assertEqual(summary["free_bytes"], {"min": 80, "avg": 90, "max": 100})
         self.assertEqual(
-            summary["other_bytes"], {"min": 150, "avg": 160, "max": 170}
+            summary["torch_inactive_cache_bytes"],
+            {"min": 100, "avg": 105, "max": 110},
+        )
+        self.assertEqual(
+            summary["effective_available_bytes"],
+            {"min": 190, "avg": 195, "max": 200},
         )
 
     def test_prefill_wave_log_selection_covers_start_interval_and_final(self):
