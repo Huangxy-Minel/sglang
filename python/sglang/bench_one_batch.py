@@ -75,21 +75,29 @@ from sglang.bench_one_batch_utils import (
     build_decode_profile_plan,
     build_decode_step_metrics,
     build_deepep_micro_warmup_shape,
+    build_mtp_cluster_cycle_metrics,
+    build_mtp_cycle_metrics,
     build_profile_trace_filename,
     build_prefill_wave_metrics,
     build_wave_chunk_plan,
+    derive_worker_ranks,
     evaluate_device_wave_admission,
     evaluate_hisparse_wave_admission,
+    exclusive_cuda_storage_bytes,
     get_local_rank_assignments,
+    merge_speculative_inputs,
     normalize_profile_activities,
     prepare_chunk_requests,
-    resolve_target_warmup_log_interval,
     resolve_one_batch_cuda_graph_max_bs,
+    resolve_target_warmup_log_interval,
     seed_for_attention_dp_group,
     should_log_prefill_wave,
     split_kv_pool_bytes,
+    speculative_slot_reserve,
     summarize_hbm_usage,
     unique_cuda_storage_bytes,
+    unfinished_request_indices,
+    validate_one_batch_speculative_mode,
     values_from_slowest_rank,
 )
 from sglang.srt.configs.model_config import ModelConfig
@@ -108,6 +116,7 @@ from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -219,6 +228,43 @@ def trace_range(name: str, enabled: bool):
     finally:
         if use_nvtx:
             torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def trace_eagle_phases(worker, enabled, prefix):
+    """Add profiler labels around the unchanged EAGLE V1 phase methods."""
+    if not enabled:
+        yield
+        return
+
+    originals = {}
+    phase_names = {
+        "forward_target_extend": "target_extend",
+        "forward_draft_extend": "draft_extend",
+        "draft": "draft",
+        "verify": "verify",
+        "forward_draft_extend_after_decode": "draft_extend",
+    }
+    for method_name, phase_name in phase_names.items():
+        original = getattr(worker, method_name)
+        originals[method_name] = (
+            method_name in worker.__dict__,
+            worker.__dict__.get(method_name),
+        )
+
+        def traced(*args, _original=original, _phase=phase_name, **kwargs):
+            with trace_range(f"{prefix}/{_phase}", True):
+                return _original(*args, **kwargs)
+
+        setattr(worker, method_name, traced)
+    try:
+        yield
+    finally:
+        for method_name, (was_instance_attr, original) in originals.items():
+            if was_instance_attr:
+                setattr(worker, method_name, original)
+            else:
+                delattr(worker, method_name)
 
 
 @dataclasses.dataclass
@@ -391,7 +437,67 @@ class BenchArgs:
 def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+    worker_ranks = derive_worker_ranks(
+        tp_rank=tp_rank,
+        tp_size=server_args.tp_size,
+        dp_size=server_args.dp_size,
+        attn_cp_size=server_args.attn_cp_size,
+        moe_dp_size=server_args.moe_dp_size,
+        ep_size=server_args.ep_size,
+        enable_dp_attention=server_args.enable_dp_attention,
+    )
+
+    spec_algorithm = SpeculativeAlgorithm.from_string(
+        server_args.speculative_algorithm
+    )
+    if not spec_algorithm.is_none():
+        if use_mlx():
+            raise ValueError("one-batch MTP is only supported on the PyTorch path")
+        target_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=worker_ranks.moe_ep_rank,
+            pp_rank=0,
+            attn_cp_rank=worker_ranks.attn_cp_rank,
+            moe_dp_rank=worker_ranks.moe_dp_rank,
+            dp_rank=(
+                worker_ranks.attn_dp_rank
+                if server_args.enable_dp_attention
+                else None
+            ),
+            nccl_port=port_args.nccl_port,
+        )
+        DraftWorkerClass = spec_algorithm.create_worker(server_args)
+        generation_worker = DraftWorkerClass(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=worker_ranks.moe_ep_rank,
+            attn_cp_rank=worker_ranks.attn_cp_rank,
+            moe_dp_rank=worker_ranks.moe_dp_rank,
+            dp_rank=(
+                worker_ranks.attn_dp_rank
+                if server_args.enable_dp_attention
+                else None
+            ),
+            nccl_port=port_args.nccl_port,
+            target_worker=target_worker,
+        )
+        model_runner = target_worker.model_runner
+        rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
+        tokenizer = target_worker.tokenizer
+        if server_args.tp_size > 1:
+            dist.barrier()
+        return (
+            _TorchBenchRunner(
+                model_runner,
+                target_worker=target_worker,
+                generation_worker=generation_worker,
+                spec_algorithm=spec_algorithm,
+            ),
+            tokenizer,
+        )
 
     model_config = ModelConfig.from_server_args(server_args)
     runner_kwargs = dict(
@@ -400,7 +506,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         gpu_id=gpu_id,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
-        moe_ep_rank=moe_ep_rank,
+        moe_ep_rank=worker_ranks.moe_ep_rank,
         moe_ep_size=server_args.ep_size,
         pp_rank=0,
         pp_size=1,
@@ -457,7 +563,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=bench_args.output_len[0],
     )
 
     reqs = []
@@ -499,6 +605,7 @@ def prepare_synthetic_inputs_for_latency_test(
     input_len,
     custom_inputs=None,
     *,
+    output_len=BenchArgs.output_len[0],
     seed=None,
     rid_offset=0,
 ):
@@ -514,7 +621,8 @@ def prepare_synthetic_inputs_for_latency_test(
         )
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=output_len,
+        ignore_eos=True,
     )
 
     reqs = []
@@ -600,30 +708,70 @@ def decode(input_token_ids, batch, model_runner):
     return next_token_ids, logits_output.next_token_logits
 
 
-def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
+def _new_idle_batch(model_runner, spec_algorithm):
+    tree_cache = TreeCacheNamespace(
+        page_size=model_runner.server_args.page_size,
+        device=model_runner.device,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+    )
+    batch = ScheduleBatch.init_new(
+        reqs=[],
+        req_to_token_pool=model_runner.req_to_token_pool,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+        tree_cache=tree_cache,
+        model_config=model_runner.model_config,
+        enable_overlap=False,
+        spec_algorithm=spec_algorithm,
+    )
+    batch.prepare_for_idle()
+    return batch
+
+
+def _maybe_prepare_mlp_sync_batch(
+    batch: Optional[ScheduleBatch],
+    model_runner,
+    spec_algorithm=SpeculativeAlgorithm.NONE,
+):
     if require_mlp_sync(model_runner.server_args):
-        prepare_mlp_sync_batch_raw(
+        return prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=get_attention_tp_size(),
             attn_cp_size=model_runner.attn_cp_size,
             tp_group=model_runner.tp_group,
-            get_idle_batch=None,
+            get_idle_batch=lambda: _new_idle_batch(model_runner, spec_algorithm),
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
             offload_tags=set(),
         )
+    return batch
 
 
 class _TorchBenchRunner:
-    """Wraps ModelRunner for the standard PyTorch benchmark path."""
+    """Wrap target and optional synchronous EAGLE workers for one-batch."""
 
-    def __init__(self, model_runner):
+    def __init__(
+        self,
+        model_runner,
+        *,
+        target_worker=None,
+        generation_worker=None,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+    ):
         self.torch_runner = model_runner
+        self.target_worker = target_worker
+        self.generation_worker = generation_worker
+        self.spec_algorithm = spec_algorithm
         self._active_batch = None
+        self._owned_reqs = []
 
     def clear(self):
+        if self._owned_reqs:
+            raise RuntimeError(
+                "cannot clear one-batch before the previous requests are released"
+            )
         if self.is_hisparse:
             coordinator = self.torch_runner.hisparse_coordinator
             if coordinator.ack_staging_queue:
@@ -640,8 +788,47 @@ class _TorchBenchRunner:
         self.torch_runner.req_to_token_pool.clear()
         self.torch_runner.token_to_kv_pool_allocator.clear()
 
-    def extend(self, reqs, sample: bool = True):
-        return extend(reqs, self.torch_runner, sample=sample)
+    def extend(
+        self,
+        reqs,
+        sample: bool = True,
+        trace_enabled: bool = False,
+        trace_prefix: str = "prefill",
+    ):
+        if not self.is_mtp:
+            return extend(reqs, self.torch_runner, sample=sample)
+
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.torch_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=(
+                self.torch_runner.token_to_kv_pool_allocator
+            ),
+            tree_cache=self._tree_cache(),
+            model_config=self.torch_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=self.spec_algorithm,
+        )
+        batch.prepare_for_extend()
+        batch.is_extend_in_batch = True
+        batch = _maybe_prepare_mlp_sync_batch(
+            batch, self.torch_runner, self.spec_algorithm
+        )
+        with trace_eagle_phases(
+            self.generation_worker, trace_enabled, trace_prefix
+        ):
+            result = self.generation_worker.forward_batch_generation(batch)
+        next_token_ids = result.next_token_ids if sample else None
+        return next_token_ids, result.logits_output.next_token_logits, batch
+
+    def _tree_cache(self):
+        runner = self.torch_runner
+        return TreeCacheNamespace(
+            page_size=runner.server_args.page_size,
+            device=runner.device,
+            req_to_token_pool=runner.req_to_token_pool,
+            token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
+        )
 
     def prefill(
         self,
@@ -652,7 +839,11 @@ class _TorchBenchRunner:
     ):
         if not chunk_plan.enabled:
             with trace_range(f"{trace_prefix}/chunk_0", trace_enabled):
-                return self.extend(reqs)
+                return self.extend(
+                    reqs,
+                    trace_enabled=trace_enabled,
+                    trace_prefix=f"{trace_prefix}/chunk_0",
+                )
 
         full_input_ids = [list(req.fill_ids) for req in reqs]
         result = None
@@ -669,7 +860,12 @@ class _TorchBenchRunner:
             with trace_range(
                 f"{trace_prefix}/chunk_{chunk_index}", trace_enabled
             ):
-                result = self.extend(reqs, sample=is_final_chunk)
+                result = self.extend(
+                    reqs,
+                    sample=is_final_chunk,
+                    trace_enabled=trace_enabled,
+                    trace_prefix=f"{trace_prefix}/chunk_{chunk_index}",
+                )
 
         assert result is not None and result[0] is not None
         return result
@@ -784,22 +980,16 @@ class _TorchBenchRunner:
         )
         return int(candidate_tensor.item())
 
-    def _build_decode_batch(self, reqs):
+    def _build_decode_batch(self, reqs, spec_info=None):
         runner = self.torch_runner
-        tree_cache = TreeCacheNamespace(
-            page_size=runner.server_args.page_size,
-            device=runner.device,
-            req_to_token_pool=runner.req_to_token_pool,
-            token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
-        )
         batch = ScheduleBatch.init_new(
             reqs=reqs,
             req_to_token_pool=runner.req_to_token_pool,
             token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
+            tree_cache=self._tree_cache(),
             model_config=runner.model_config,
             enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
+            spec_algorithm=self.spec_algorithm,
         )
         batch.req_pool_indices = torch.tensor(
             [req.req_pool_idx for req in reqs],
@@ -825,6 +1015,7 @@ class _TorchBenchRunner:
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, runner.model_config.vocab_size
         )
+        batch.spec_info = spec_info
         if self.is_hisparse:
             batch.hisparse_coordinator = runner.hisparse_coordinator
         return batch
@@ -853,6 +1044,7 @@ class _TorchBenchRunner:
             self.torch_runner.hisparse_coordinator if self.is_hisparse else None
         )
         ready_reqs = []
+        draft_inputs = []
         capacity_snapshots = []
         prefill_compute_latency = 0.0
         staging_latency = 0.0
@@ -915,6 +1107,9 @@ class _TorchBenchRunner:
                         input_len=input_len,
                         output_len=output_len,
                         page_size=self.page_size,
+                        speculative_reserve_per_request=(
+                            self.speculative_reserve_per_request
+                        ),
                     )
                     requirements = {"required_tokens": admission.required_tokens}
                 limiting_rank = self._cluster_limiting_rank(
@@ -943,7 +1138,7 @@ class _TorchBenchRunner:
                 wave_tic = time.perf_counter()
                 self.synchronize()
                 compute_tic = time.perf_counter()
-                next_token_ids, _, _ = self.prefill(
+                next_token_ids, _, wave_batch = self.prefill(
                     [req],
                     chunk_plan=chunk_plan,
                     trace_enabled=trace_enabled,
@@ -952,6 +1147,13 @@ class _TorchBenchRunner:
                 self.synchronize()
                 prefill_compute_latency += time.perf_counter() - compute_tic
                 req.output_ids.append(int(next_token_ids[0].item()))
+                req.check_finished()
+                if self.is_mtp:
+                    if wave_batch.spec_info is None:
+                        raise RuntimeError(
+                            "EAGLE prefill did not produce draft state"
+                        )
+                    draft_inputs.append(wave_batch.spec_info)
 
                 if self.is_hisparse:
                     # Stage once after all chunks of this request have completed.
@@ -1026,12 +1228,17 @@ class _TorchBenchRunner:
                     self.synchronize()
                 control_latency += time.perf_counter() - control_tic
 
-            batch = self._build_decode_batch(ready_reqs)
+            spec_info = (
+                merge_speculative_inputs(draft_inputs) if self.is_mtp else None
+            )
+            batch = self._build_decode_batch(ready_reqs, spec_info=spec_info)
             self._active_batch = batch
+            self._owned_reqs = list(ready_reqs)
         except Exception:
             for req in reqs:
                 self._release_request(req)
             self._active_batch = None
+            self._owned_reqs = []
             raise
         return batch.output_ids.clone(), batch, {
             "requested_batch_size": requested_batch_size,
@@ -1085,6 +1292,66 @@ class _TorchBenchRunner:
             logits_output.next_token_logits,
             core_forward_tpot,
         )
+
+    def mtp_decode_cycle(self, batch, *, trace_enabled: bool, trace_name: str):
+        if not self.is_mtp:
+            raise RuntimeError("mtp_decode_cycle requires EAGLE")
+
+        active_batch_size = len(batch.reqs)
+        if active_batch_size:
+            batch.prepare_for_decode()
+            batch.is_extend_in_batch = False
+        else:
+            batch = None
+
+        batch = _maybe_prepare_mlp_sync_batch(
+            batch, self.torch_runner, self.spec_algorithm
+        )
+        if batch is None:
+            batch = _new_idle_batch(self.torch_runner, self.spec_algorithm)
+
+        self.synchronize()
+        with trace_range(trace_name, trace_enabled):
+            core_tic = time.perf_counter()
+            with trace_eagle_phases(
+                self.generation_worker, trace_enabled, trace_name
+            ):
+                result = self.generation_worker.forward_batch_generation(batch)
+            self.synchronize()
+            core_cycle_latency = time.perf_counter() - core_tic
+
+        accepted_draft_tokens = result.accept_length_per_req_cpu or []
+        if active_batch_size != len(accepted_draft_tokens):
+            raise RuntimeError(
+                "EAGLE acceptance count does not match the active batch: "
+                f"active={active_batch_size}, "
+                f"acceptance={len(accepted_draft_tokens)}"
+            )
+        if active_batch_size:
+            batch.filter_batch(v1_spec_info_filtered=True)
+        self._active_batch = batch
+        return batch, accepted_draft_tokens, core_cycle_latency
+
+    def sum_unique_dp(self, value):
+        ranks = derive_worker_ranks(
+            tp_rank=self.torch_runner.tp_rank,
+            tp_size=self.torch_runner.server_args.tp_size,
+            dp_size=self.torch_runner.server_args.dp_size,
+            attn_cp_size=self.torch_runner.server_args.attn_cp_size,
+            moe_dp_size=self.torch_runner.server_args.moe_dp_size,
+            ep_size=self.torch_runner.server_args.ep_size,
+            enable_dp_attention=self.torch_runner.server_args.enable_dp_attention,
+        )
+        unique_value = (
+            value if ranks.attn_tp_rank == 0 and ranks.attn_cp_rank == 0 else 0
+        )
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return unique_value
+        tensor = torch.tensor(unique_value, dtype=torch.int64, device="cpu")
+        dist.all_reduce(
+            tensor, op=dist.ReduceOp.SUM, group=get_tp_group().cpu_group
+        )
+        return int(tensor.item())
 
     def _release_request(self, req):
         if req.req_pool_idx is None:
@@ -1145,20 +1412,30 @@ class _TorchBenchRunner:
             raise RuntimeError("device KV pool leaked after one-batch cleanup")
 
     def cleanup(self, batch):
-        if batch is None:
+        if batch is None and not self._owned_reqs:
             return
 
         try:
-            for req in batch.reqs:
+            owned_reqs = self._owned_reqs or list(batch.reqs)
+            for req in owned_reqs:
                 self._release_request(req)
+            self._owned_reqs = []
             self._assert_pools_restored()
         finally:
-            if batch is self._active_batch:
-                self._active_batch = None
+            self._active_batch = None
 
     def cleanup_active_batch(self):
-        if self._active_batch is not None:
+        if self._active_batch is not None or self._owned_reqs:
             self.cleanup(self._active_batch)
+
+    def assert_exact_output_len(self, output_len):
+        actual = [len(req.output_ids) for req in self._owned_reqs]
+        unfinished = unfinished_request_indices(actual, output_len)
+        if unfinished:
+            raise RuntimeError(
+                "one-batch MTP did not generate the requested exact output "
+                f"length {output_len}: unfinished={unfinished}, lengths={actual}"
+            )
 
     def _hbm_usage_snapshot(self) -> HBMUsageSnapshot:
         runner = self.torch_runner
@@ -1179,6 +1456,31 @@ class _TorchBenchRunner:
         )
         kv_usage = split_kv_pool_bytes(int(kv_total_bytes), indexer_bytes)
 
+        draft_model_bytes = 0
+        draft_kv_usage = {"kv_data_bytes": 0, "kv_indexer_bytes": 0}
+        draft_graph_bytes = 0
+        if self.is_mtp:
+            draft_runner = self.generation_worker.draft_model_runner
+            draft_model_tensors = list(draft_runner.model.parameters()) + list(
+                draft_runner.model.buffers()
+            )
+            draft_model_bytes = exclusive_cuda_storage_bytes(
+                draft_model_tensors, model_tensors
+            )
+            draft_kv_cache = draft_runner.token_to_kv_pool
+            draft_kv_total_bytes = draft_kv_cache.get_kv_size_bytes()
+            if isinstance(draft_kv_total_bytes, tuple):
+                draft_kv_total_bytes = sum(draft_kv_total_bytes)
+            draft_indexer_bytes = unique_cuda_storage_bytes(
+                getattr(draft_kv_cache, "index_k_with_scale_buffer", ())
+            )
+            draft_kv_usage = split_kv_pool_bytes(
+                int(draft_kv_total_bytes), draft_indexer_bytes
+            )
+            draft_graph_bytes = max(
+                0, int(round(draft_runner.graph_mem_usage * (1 << 30)))
+            )
+
         deepep_configured_bytes = 0
         if runner.server_args.moe_a2a_backend == "deepep":
             from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
@@ -1193,9 +1495,13 @@ class _TorchBenchRunner:
             model_bytes=model_bytes,
             kv_data_bytes=kv_usage["kv_data_bytes"],
             kv_indexer_bytes=kv_usage["kv_indexer_bytes"],
+            draft_model_bytes=draft_model_bytes,
+            draft_kv_data_bytes=draft_kv_usage["kv_data_bytes"],
+            draft_kv_indexer_bytes=draft_kv_usage["kv_indexer_bytes"],
             cuda_graph_bytes=max(
                 0, int(round(runner.graph_mem_usage * (1 << 30)))
-            ),
+            )
+            + draft_graph_bytes,
             deepep_configured_bytes=deepep_configured_bytes,
         )
 
@@ -1251,6 +1557,23 @@ class _TorchBenchRunner:
     @property
     def is_hisparse(self):
         return self.torch_runner.hisparse_coordinator is not None
+
+    @property
+    def is_mtp(self):
+        return self.generation_worker is not None
+
+    @property
+    def speculative_reserve_per_request(self):
+        if not self.is_mtp:
+            return 0
+        return speculative_slot_reserve(
+            num_steps=self.torch_runner.server_args.speculative_num_steps,
+            topk=self.torch_runner.server_args.speculative_eagle_topk,
+            num_draft_tokens=(
+                self.torch_runner.server_args.speculative_num_draft_tokens
+            ),
+            page_size=self.page_size,
+        )
 
     @property
     def page_size(self):
@@ -1473,9 +1796,15 @@ def print_hbm_usage_report(summary, rank_print):
     rank_print(
         f"Per-GPU GiB (min / avg / max across {num_ranks} model ranks)"
     )
-    format_row("Model", "model_bytes")
-    format_row("KV data pool", "kv_data_bytes")
-    format_row("KV indexer pool", "kv_indexer_bytes")
+    format_row("Target model", "model_bytes")
+    if summary["draft_model_bytes"]["max"] > 0:
+        format_row("Draft-only model", "draft_model_bytes")
+    format_row("Target KV data pool", "kv_data_bytes")
+    format_row("Target KV indexer pool", "kv_indexer_bytes")
+    if summary["draft_kv_data_bytes"]["max"] > 0:
+        format_row("Draft KV data pool", "draft_kv_data_bytes")
+    if summary["draft_kv_indexer_bytes"]["max"] > 0:
+        format_row("Draft KV indexer pool", "draft_kv_indexer_bytes")
     format_row("PyTorch active other", "torch_active_other_bytes")
     format_row("Native/external allocations", "native_external_bytes")
     format_row(
@@ -1494,6 +1823,215 @@ def print_hbm_usage_report(summary, rank_print):
     rank_print("CUDA Graph capture delta (non-additive)")
     format_row("Driver-used delta", "cuda_graph_bytes", indent="  ")
     rank_print("========================")
+
+
+def _run_mtp_decode(
+    *,
+    model_runner,
+    batch,
+    server_args,
+    rank_print,
+    log_decode_step,
+    decode_profile_plan,
+    profile_owner,
+    profile_activities,
+    profile_record_shapes,
+    profile_with_stack,
+    profile_output_dir,
+    profile_filename_prefix,
+    input_len,
+    output_len,
+    batch_size,
+):
+    if any(req.finished() for req in batch.reqs):
+        batch.filter_batch(v1_spec_info_filtered=False)
+
+    process_latencies = []
+    normalized_tpots = []
+    cycle_metrics = []
+    profiler = None
+    profile_started = False
+    profile_capture_completed = False
+    total_process_latency = 0.0
+    total_local_accepted = 0
+    total_local_core_latency = 0.0
+    total_cluster_accepted = 0
+    total_cluster_core_latency = 0.0
+    cycle_index = 0
+
+    while model_runner.sum_unique_dp(len(batch.reqs)) > 0:
+        profile_action = decode_profile_plan.action_for_step(cycle_index)
+        if profile_owner and cycle_index == decode_profile_plan.start_step:
+            profiler = start_profile(
+                profile_activities,
+                profile_record_shapes=profile_record_shapes,
+                profile_with_stack=profile_with_stack,
+                rank_print=rank_print,
+            )
+            profile_started = True
+
+        active_batch_size = len(batch.reqs)
+        model_runner.synchronize()
+        process_tic = time.perf_counter()
+        batch, accepted_draft_tokens, core_cycle_latency = (
+            model_runner.mtp_decode_cycle(
+                batch,
+                trace_enabled=profile_owner and profile_action.profile,
+                trace_name=f"decode/step_{cycle_index}",
+            )
+        )
+        model_runner.synchronize()
+        process_latency = time.perf_counter() - process_tic
+
+        local_accepted_tokens = (
+            sum(accepted_draft_tokens) + active_batch_size
+        )
+        cluster_accepted_tokens = model_runner.sum_unique_dp(
+            local_accepted_tokens
+        )
+        max_core_cycle_latency = model_runner.max_reduce(
+            [core_cycle_latency]
+        )[0]
+        cluster_metrics = build_mtp_cluster_cycle_metrics(
+            unique_dp_accepted_tokens=cluster_accepted_tokens,
+            max_core_cycle_latency=max_core_cycle_latency,
+        )
+        global_active_batch_size = model_runner.sum_unique_dp(active_batch_size)
+
+        local_metrics = None
+        if active_batch_size:
+            local_metrics = build_mtp_cycle_metrics(
+                accepted_draft_tokens=accepted_draft_tokens,
+                speculative_num_steps=server_args.speculative_num_steps,
+                process_latency=process_latency,
+                core_cycle_latency=core_cycle_latency,
+            )
+            process_latencies.append(process_latency)
+            normalized_tpots.append(local_metrics["normalized_tpot_ms"] / 1000)
+
+        average_accepted_length = (
+            cluster_accepted_tokens / global_active_batch_size
+        )
+        cluster_draft_accepted = (
+            cluster_accepted_tokens - global_active_batch_size
+        )
+        cycle = {
+            "cycle": cycle_index,
+            "active_batch_size": active_batch_size,
+            "global_active_batch_size": global_active_batch_size,
+            "local": local_metrics,
+            **cluster_metrics,
+            "cluster_average_accepted_length": average_accepted_length,
+            "cluster_normalized_tpot_ms": (
+                max_core_cycle_latency / average_accepted_length * 1000
+            ),
+            "cluster_draft_acceptance_rate": (
+                cluster_draft_accepted
+                / (global_active_batch_size * server_args.speculative_num_steps)
+            ),
+        }
+        cycle_metrics.append(cycle)
+        total_process_latency += process_latency
+        total_local_accepted += local_accepted_tokens
+        if active_batch_size:
+            total_local_core_latency += core_cycle_latency
+        total_cluster_accepted += cluster_accepted_tokens
+        total_cluster_core_latency += max_core_cycle_latency
+
+        if cycle_index < 5 or (
+            log_decode_step > 0 and cycle_index % log_decode_step == 0
+        ):
+            local_text = (
+                f"normalized TPOT: {local_metrics['normalized_tpot_ms']:.3f} "
+                f"ms/token, throughput/DP: "
+                f"{local_metrics['throughput_per_dp']:.2f} token/s, "
+                f"avg accepted: "
+                f"{local_metrics['average_accepted_length']:.2f}, "
+                f"draft acceptance: "
+                f"{local_metrics['draft_acceptance_rate']:.2%}, "
+                if local_metrics is not None
+                else "local DP idle, "
+            )
+            rank_print(
+                f"MTP decode {cycle_index}. BS/DP: {active_batch_size}, "
+                f"global active BS: {global_active_batch_size}, "
+                f"process latency: {process_latency * 1000:.3f} ms, "
+                + local_text
+                + f"cluster normalized TPOT: "
+                f"{cycle['cluster_normalized_tpot_ms']:.3f} ms/token, "
+                f"cluster throughput: "
+                f"{cluster_metrics['cluster_throughput']:.2f} token/s"
+            )
+
+        if profile_owner and profile_started and (
+            cycle_index >= decode_profile_plan.end_step - 1
+        ):
+            trace_filename = _create_torch_profiler_filename(
+                profile_output_dir,
+                profile_filename_prefix,
+                batch_size,
+                input_len,
+                output_len,
+                "decode",
+                server_args,
+            )
+            stop_profile(
+                profiler,
+                profile_activities,
+                rank_print=rank_print,
+                save_trace=True,
+                trace_filename=trace_filename,
+                stage="decode",
+            )
+            profiler = None
+            profile_started = False
+
+        if (
+            decode_profile_plan.enabled
+            and cycle_index == decode_profile_plan.end_step - 1
+        ):
+            profile_capture_completed = True
+        if profile_action.exit_after_step:
+            model_runner.barrier()
+            break
+
+        cycle_index += 1
+        if cycle_index > output_len - 1:
+            raise RuntimeError(
+                "MTP decode exceeded the maximum number of single-token cycles"
+            )
+
+    if profile_started:
+        trace_filename = _create_torch_profiler_filename(
+            profile_output_dir,
+            profile_filename_prefix,
+            batch_size,
+            input_len,
+            output_len,
+            "decode",
+            server_args,
+        )
+        stop_profile(
+            profiler,
+            profile_activities,
+            rank_print=rank_print,
+            save_trace=True,
+            trace_filename=trace_filename,
+            stage="decode",
+        )
+
+    return {
+        "batch": batch,
+        "process_latencies": process_latencies,
+        "normalized_tpots": normalized_tpots,
+        "cycles": cycle_metrics,
+        "total_process_latency": total_process_latency,
+        "total_local_accepted_tokens": total_local_accepted,
+        "total_local_core_latency": total_local_core_latency,
+        "total_cluster_accepted_tokens": total_cluster_accepted,
+        "total_cluster_core_latency": total_cluster_core_latency,
+        "profile_capture_completed": profile_capture_completed,
+    }
 
 
 def latency_test_run_once(
@@ -1525,6 +2063,7 @@ def latency_test_run_once(
 ):
     requested_batch_size = batch_size
     is_hisparse = getattr(model_runner, "is_hisparse", False)
+    is_mtp = getattr(model_runner, "is_mtp", False)
     input_lengths = {len(req.fill_ids) for req in reqs}
     if input_lengths != {input_len}:
         raise ValueError(
@@ -1718,7 +2257,59 @@ def latency_test_run_once(
     profiler = None
     decode_profile_started = False
     profile_capture_completed = False
-    for i in range(output_len - 1):
+    mtp_decode_result = None
+    if is_mtp:
+        mtp_decode_result = _run_mtp_decode(
+            model_runner=model_runner,
+            batch=batch,
+            server_args=server_args,
+            rank_print=rank_print,
+            log_decode_step=log_decode_step,
+            decode_profile_plan=decode_profile_plan,
+            profile_owner=enable_profile_decode,
+            profile_activities=profile_activities,
+            profile_record_shapes=profile_record_shapes,
+            profile_with_stack=profile_with_stack,
+            profile_output_dir=profile_output_dir,
+            profile_filename_prefix=profile_filename_prefix,
+            input_len=input_len,
+            output_len=output_len,
+            batch_size=batch_size,
+        )
+        batch = mtp_decode_result["batch"]
+        decode_process_latencies = mtp_decode_result["process_latencies"]
+        core_forward_tpots = mtp_decode_result["normalized_tpots"]
+        profile_capture_completed = mtp_decode_result[
+            "profile_capture_completed"
+        ]
+        tot_latency += mtp_decode_result["total_process_latency"]
+        local_core_latency = mtp_decode_result["total_local_core_latency"]
+        cluster_core_latency = mtp_decode_result["total_cluster_core_latency"]
+        measurement_results.update(
+            {
+                "mtp_cycles": mtp_decode_result["cycles"],
+                "mtp_total_accepted_tokens_per_dp": mtp_decode_result[
+                    "total_local_accepted_tokens"
+                ],
+                "mtp_total_cluster_accepted_tokens": mtp_decode_result[
+                    "total_cluster_accepted_tokens"
+                ],
+                "mtp_decode_throughput_per_dp": (
+                    mtp_decode_result["total_local_accepted_tokens"]
+                    / local_core_latency
+                    if local_core_latency > 0
+                    else 0.0
+                ),
+                "mtp_cluster_decode_throughput": (
+                    mtp_decode_result["total_cluster_accepted_tokens"]
+                    / cluster_core_latency
+                    if cluster_core_latency > 0
+                    else 0.0
+                ),
+            }
+        )
+
+    for i in (() if is_mtp else range(output_len - 1)):
         profile_action = decode_profile_plan.action_for_step(i)
         model_runner.synchronize()
         # Start profiler at the specified step
@@ -1827,7 +2418,11 @@ def latency_test_run_once(
             stage="decode",
         )
 
-    measurement_results["executed_decode_steps"] = len(decode_process_latencies)
+    measurement_results["executed_decode_steps"] = (
+        len(mtp_decode_result["cycles"])
+        if mtp_decode_result is not None
+        else len(decode_process_latencies)
+    )
     if decode_profile_plan.enabled:
         profile_early_exit = (
             profile_capture_completed
@@ -1852,48 +2447,106 @@ def latency_test_run_once(
     if decode_process_latencies:
         med_decode_latency = float(np.median(decode_process_latencies))
         med_core_forward_tpot = float(np.median(core_forward_tpots))
-        med_decode_metrics = build_decode_step_metrics(
-            batch_size=batch_size,
-            dp_size=server_args.dp_size,
-            process_latency=med_decode_latency,
-            core_forward_tpot=med_core_forward_tpot,
-        )
-        rank_print(
-            f"Decode median. BS/DP: {batch_size}, "
-            f"global BS: {batch_size * server_args.dp_size}, "
-            f"process latency: "
-            f"{med_decode_metrics['process_latency_ms']:.3f} ms, "
-            f"core TPOT: {med_decode_metrics['tpot_ms']:.3f} ms/token, "
-            f"throughput/DP: "
-            f"{med_decode_metrics['throughput_per_dp']:.2f} token/s, "
-            f"cluster throughput (est.): "
-            f"{med_decode_metrics['cluster_throughput']:.2f} token/s"
-        )
-        measurement_results["median_decode_latency"] = med_decode_latency
-        measurement_results["median_decode_latency_ms"] = med_decode_metrics[
-            "process_latency_ms"
-        ]
-        measurement_results["median_core_forward_tpot"] = med_core_forward_tpot
-        measurement_results["median_core_forward_tpot_ms"] = med_decode_metrics[
-            "tpot_ms"
-        ]
-        measurement_results["median_decode_tpot_ms"] = med_decode_metrics["tpot_ms"]
-        measurement_results["median_decode_throughput"] = med_decode_metrics[
-            "throughput_per_dp"
-        ]
-        measurement_results["median_decode_throughput_per_dp"] = (
-            med_decode_metrics["throughput_per_dp"]
-        )
+        if is_mtp:
+            local_cycles = [
+                cycle["local"]
+                for cycle in mtp_decode_result["cycles"]
+                if cycle["local"] is not None
+            ]
+            median_throughput_per_dp = float(
+                np.median([cycle["throughput_per_dp"] for cycle in local_cycles])
+            )
+            median_cluster_throughput = float(
+                np.median(
+                    [
+                        cycle["cluster_throughput"]
+                        for cycle in mtp_decode_result["cycles"]
+                    ]
+                )
+            )
+            rank_print(
+                f"MTP decode median. initial BS/DP: {batch_size}, "
+                f"process latency: {med_decode_latency * 1000:.3f} ms, "
+                f"normalized TPOT: {med_core_forward_tpot * 1000:.3f} "
+                f"ms/token, throughput/DP: "
+                f"{median_throughput_per_dp:.2f} token/s, "
+                f"cluster throughput: {median_cluster_throughput:.2f} token/s"
+            )
+            measurement_results.update(
+                {
+                    "median_decode_latency": med_decode_latency,
+                    "median_decode_latency_ms": med_decode_latency * 1000,
+                    "median_core_forward_tpot": med_core_forward_tpot,
+                    "median_core_forward_tpot_ms": med_core_forward_tpot * 1000,
+                    "median_decode_tpot_ms": med_core_forward_tpot * 1000,
+                    "median_decode_throughput": median_throughput_per_dp,
+                    "median_decode_throughput_per_dp": (
+                        median_throughput_per_dp
+                    ),
+                    "mtp_median_cluster_throughput": (
+                        median_cluster_throughput
+                    ),
+                }
+            )
+        else:
+            med_decode_metrics = build_decode_step_metrics(
+                batch_size=batch_size,
+                dp_size=server_args.dp_size,
+                process_latency=med_decode_latency,
+                core_forward_tpot=med_core_forward_tpot,
+            )
+            rank_print(
+                f"Decode median. BS/DP: {batch_size}, "
+                f"global BS: {batch_size * server_args.dp_size}, "
+                f"process latency: "
+                f"{med_decode_metrics['process_latency_ms']:.3f} ms, "
+                f"core TPOT: {med_decode_metrics['tpot_ms']:.3f} ms/token, "
+                f"throughput/DP: "
+                f"{med_decode_metrics['throughput_per_dp']:.2f} token/s, "
+                f"cluster throughput (est.): "
+                f"{med_decode_metrics['cluster_throughput']:.2f} token/s"
+            )
+            measurement_results["median_decode_latency"] = med_decode_latency
+            measurement_results["median_decode_latency_ms"] = med_decode_metrics[
+                "process_latency_ms"
+            ]
+            measurement_results["median_core_forward_tpot"] = med_core_forward_tpot
+            measurement_results["median_core_forward_tpot_ms"] = med_decode_metrics[
+                "tpot_ms"
+            ]
+            measurement_results["median_decode_tpot_ms"] = med_decode_metrics[
+                "tpot_ms"
+            ]
+            measurement_results["median_decode_throughput"] = med_decode_metrics[
+                "throughput_per_dp"
+            ]
+            measurement_results["median_decode_throughput_per_dp"] = (
+                med_decode_metrics["throughput_per_dp"]
+            )
 
     if measurement_results.get("profile_early_exit", False):
         rank_print(
             "Profile capture complete. "
-            f"executed decode steps={len(decode_process_latencies)}, "
+            f"executed decode steps={measurement_results['executed_decode_steps']}, "
             f"profiled steps={decode_profile_plan.profiled_steps}; "
             "skipping complete-output end-to-end metrics."
         )
         model_runner.cleanup(batch)
         return measurement_results
+
+    if is_mtp:
+        model_runner.assert_exact_output_len(output_len)
+        rank_print(
+            "MTP decode aggregate. "
+            f"accepted tokens/DP: "
+            f"{measurement_results['mtp_total_accepted_tokens_per_dp']}, "
+            f"throughput/DP: "
+            f"{measurement_results['mtp_decode_throughput_per_dp']:.2f} "
+            f"token/s, cluster accepted tokens: "
+            f"{measurement_results['mtp_total_cluster_accepted_tokens']}, "
+            f"cluster throughput: "
+            f"{measurement_results['mtp_cluster_decode_throughput']:.2f} token/s"
+        )
 
     throughput = (input_len + output_len) * batch_size / tot_latency
     rank_print(
@@ -1926,6 +2579,13 @@ def latency_test_run_once(
         cluster_median_core_forward_tpot=cluster_median_core_forward_tpot,
         cluster_total_latency=cluster_total_latency,
     )
+    if is_mtp and med_decode_latency is not None:
+        cluster_metrics["cluster_median_decode_throughput_per_dp"] = (
+            measurement_results["median_decode_throughput_per_dp"]
+        )
+        cluster_metrics["cluster_median_decode_throughput"] = (
+            measurement_results["mtp_median_cluster_throughput"]
+        )
     measurement_results.update(cluster_metrics)
     rank_print(
         "Cluster. "
@@ -1935,13 +2595,14 @@ def latency_test_run_once(
         f"overall throughput: {cluster_metrics['cluster_overall_throughput']:9.2f} token/s"
     )
     if "cluster_median_decode_latency" in cluster_metrics:
+        tpot_label = "normalized TPOT" if is_mtp else "core TPOT"
         rank_print(
             "Cluster decode. "
             f"BS/DP: {batch_size}, "
             f"global BS: {cluster_metrics['global_batch_size']}, "
             f"process latency: "
             f"{cluster_metrics['cluster_median_decode_latency_ms']:.3f} ms, "
-            f"core TPOT: "
+            f"{tpot_label}: "
             f"{cluster_metrics['cluster_median_core_forward_tpot_ms']:.3f} ms/token, "
             f"throughput/DP: "
             f"{cluster_metrics['cluster_median_decode_throughput_per_dp']:.2f} token/s, "
@@ -1994,6 +2655,7 @@ def latency_test(
             micro_batch_size,
             micro_input_len,
             custom_inputs=[list(range(micro_input_len))],
+            output_len=micro_output_len,
         )
         micro_chunk_plan = build_chunk_plan(
             input_lengths=[micro_input_len] * micro_batch_size,
@@ -2027,6 +2689,7 @@ def latency_test(
     reqs = prepare_synthetic_inputs_for_latency_test(
         bench_args.batch_size[0],
         bench_args.input_len[0],
+        output_len=min(32, bench_args.output_len[0]),
         seed=attention_dp_seed,
         rid_offset=attention_dp_rank * bench_args.batch_size[0],
     )
@@ -2112,6 +2775,7 @@ def latency_test(
             bs,
             il,
             bs_aligned_inputs,
+            output_len=ol,
             seed=attention_dp_seed,
             rid_offset=attention_dp_rank * bs,
         )
@@ -2196,6 +2860,19 @@ def wait_for_workers(workers):
 
 
 def main(server_args, bench_args):
+    validate_one_batch_speculative_mode(
+        spec_algorithm=server_args.speculative_algorithm,
+        enable_hisparse=server_args.enable_hisparse,
+        correctness_test=bench_args.correctness_test,
+        profile_enabled=bench_args.profile,
+        profile_execution_mode=bench_args.profile_execution_mode,
+        model_path=server_args.model_path,
+        draft_model_path=server_args.speculative_draft_model_path,
+    )
+    if server_args.speculative_algorithm is not None:
+        # one-batch deliberately exercises the synchronous EAGLE V1 lifecycle.
+        server_args.disable_overlap_schedule = True
+
     server_args.cuda_graph_max_bs = resolve_one_batch_cuda_graph_max_bs(
         server_args.cuda_graph_max_bs, bench_args.batch_size
     )

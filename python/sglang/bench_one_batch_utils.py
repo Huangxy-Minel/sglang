@@ -96,6 +96,16 @@ class DeviceAdmissionDecision:
 
 
 @dataclass(frozen=True)
+class WorkerRanks:
+    attn_dp_rank: int
+    attn_tp_rank: int
+    attn_tp_size: int
+    attn_cp_rank: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+
+
+@dataclass(frozen=True)
 class HBMUsageSnapshot:
     total_bytes: int
     free_bytes: int
@@ -105,6 +115,9 @@ class HBMUsageSnapshot:
     kv_data_bytes: int
     kv_indexer_bytes: int
     cuda_graph_bytes: int
+    draft_model_bytes: int = 0
+    draft_kv_data_bytes: int = 0
+    draft_kv_indexer_bytes: int = 0
     deepep_configured_bytes: int = 0
 
 
@@ -230,6 +243,30 @@ def unique_cuda_storage_bytes(tensors: Sequence[object]) -> int:
     return sum(storages.values())
 
 
+def exclusive_cuda_storage_bytes(
+    tensors: Sequence[object], excluded_tensors: Sequence[object]
+) -> int:
+    """Count CUDA storage in ``tensors`` that is not shared with exclusions."""
+
+    excluded = set()
+    for tensor in excluded_tensors:
+        device = str(getattr(tensor, "device", ""))
+        if device.startswith("cuda"):
+            storage = tensor.untyped_storage()
+            excluded.add((device, storage.data_ptr()))
+
+    storages: dict[tuple[str, int], int] = {}
+    for tensor in tensors:
+        device = str(getattr(tensor, "device", ""))
+        if not device.startswith("cuda"):
+            continue
+        storage = tensor.untyped_storage()
+        key = (device, storage.data_ptr())
+        if key not in excluded:
+            storages[key] = max(storages.get(key, 0), storage.nbytes())
+    return sum(storages.values())
+
+
 def split_kv_pool_bytes(total_bytes: int, indexer_bytes: int) -> dict[str, int]:
     if total_bytes < 0 or indexer_bytes < 0:
         raise ValueError("KV storage values must be non-negative")
@@ -265,6 +302,9 @@ def build_hbm_usage(snapshot: HBMUsageSnapshot) -> dict[str, int]:
         snapshot.model_bytes
         + snapshot.kv_data_bytes
         + snapshot.kv_indexer_bytes
+        + snapshot.draft_model_bytes
+        + snapshot.draft_kv_data_bytes
+        + snapshot.draft_kv_indexer_bytes
     )
     if known_active_bytes > snapshot.torch_active_bytes:
         raise ValueError(
@@ -352,6 +392,55 @@ def get_local_rank_assignments(
         (global_start + local_gpu_id, local_gpu_id)
         for local_gpu_id in range(ranks_per_node)
     ]
+
+
+def derive_worker_ranks(
+    *,
+    tp_rank: int,
+    tp_size: int,
+    dp_size: int,
+    attn_cp_size: int,
+    moe_dp_size: int,
+    ep_size: int,
+    enable_dp_attention: bool,
+) -> WorkerRanks:
+    """Mirror the online controller's attention and MoE rank layout."""
+    values = (tp_size, dp_size, attn_cp_size, moe_dp_size, ep_size)
+    if any(value <= 0 for value in values):
+        raise ValueError("parallel sizes must be positive")
+    if tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+
+    attn_dp_size = dp_size if enable_dp_attention else 1
+    attn_denominator = attn_dp_size * attn_cp_size
+    if tp_size % attn_denominator != 0:
+        raise ValueError(
+            "tp_size must be divisible by dp_size * attn_cp_size for DP attention"
+        )
+    attn_tp_size = tp_size // attn_denominator
+    attn_tp_rank = tp_rank % attn_tp_size
+    attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
+    attn_dp_rank = (
+        tp_rank // (attn_tp_size * attn_cp_size)
+        if enable_dp_attention
+        else 0
+    )
+
+    if tp_size % moe_dp_size != 0:
+        raise ValueError("tp_size must be divisible by moe_dp_size")
+    ranks_per_moe_dp = tp_size // moe_dp_size
+    if ranks_per_moe_dp % ep_size != 0:
+        raise ValueError("ranks per MoE DP group must be divisible by ep_size")
+    moe_dp_rank = tp_rank // ranks_per_moe_dp
+    moe_ep_rank = (tp_rank % ranks_per_moe_dp) // (ranks_per_moe_dp // ep_size)
+    return WorkerRanks(
+        attn_dp_rank=attn_dp_rank,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_rank=attn_cp_rank,
+        moe_dp_rank=moe_dp_rank,
+        moe_ep_rank=moe_ep_rank,
+    )
 
 
 def build_chunk_plan(
@@ -443,6 +532,63 @@ def global_requested_batch_size(batch_size: int, dp_size: int) -> int:
     return batch_size * dp_size
 
 
+def speculative_slot_reserve(
+    *, num_steps: int, topk: int, num_draft_tokens: int, page_size: int
+) -> int:
+    """Return the page-aligned peak temporary target-KV reserve per request."""
+    if min(num_steps, topk, num_draft_tokens, page_size) <= 0:
+        raise ValueError("speculative decoding sizes must be positive")
+    return _align_up(max(num_steps * topk, num_draft_tokens), page_size)
+
+
+def merge_speculative_inputs(spec_inputs: Sequence[object]):
+    """Merge per-wave draft states in request order."""
+    if not spec_inputs:
+        raise ValueError("at least one speculative input is required")
+    merged = spec_inputs[0]
+    for spec_input in spec_inputs[1:]:
+        merged.merge_batch(spec_input)
+    return merged
+
+
+def unfinished_request_indices(
+    generated_lengths: Sequence[int], output_len: int
+) -> list[int]:
+    if output_len <= 0:
+        raise ValueError("output_len must be positive")
+    if any(length < 0 or length > output_len for length in generated_lengths):
+        raise ValueError("generated lengths must be between zero and output_len")
+    return [
+        index
+        for index, generated_length in enumerate(generated_lengths)
+        if generated_length < output_len
+    ]
+
+
+def validate_one_batch_speculative_mode(
+    *,
+    spec_algorithm: Optional[str],
+    enable_hisparse: bool,
+    correctness_test: bool,
+    profile_enabled: bool,
+    profile_execution_mode: str,
+    model_path: str,
+    draft_model_path: Optional[str],
+) -> None:
+    if spec_algorithm is None:
+        return
+    if spec_algorithm.upper() != "EAGLE":
+        raise ValueError("one-batch speculative decoding currently supports EAGLE only")
+    if enable_hisparse:
+        raise ValueError("one-batch MTP does not yet support HiSparse")
+    if correctness_test:
+        raise ValueError("one-batch MTP does not support correctness mode")
+    if profile_enabled and profile_execution_mode != "runtime":
+        raise ValueError("one-batch MTP profiling requires runtime execution mode")
+    if draft_model_path is not None and draft_model_path != model_path:
+        raise ValueError("one-batch MTP does not support an external draft model")
+
+
 def seed_for_attention_dp_group(random_seed: int, attention_dp_rank: int) -> int:
     if attention_dp_rank < 0:
         raise ValueError("attention_dp_rank must be non-negative")
@@ -474,6 +620,63 @@ def build_decode_step_metrics(
         "tpot_ms": core_forward_tpot * 1000,
         "throughput_per_dp": batch_size / core_forward_tpot,
         "cluster_throughput": batch_size * dp_size / core_forward_tpot,
+    }
+
+
+def build_mtp_cycle_metrics(
+    *,
+    accepted_draft_tokens: Sequence[int],
+    speculative_num_steps: int,
+    process_latency: float,
+    core_cycle_latency: float,
+) -> dict[str, float | int]:
+    """Build metrics for one synchronous draft/verify/commit/extend cycle."""
+    active_batch_size = len(accepted_draft_tokens)
+    if active_batch_size <= 0:
+        raise ValueError("an MTP cycle must contain at least one active request")
+    if speculative_num_steps <= 0:
+        raise ValueError("speculative_num_steps must be positive")
+    if process_latency <= 0 or core_cycle_latency <= 0:
+        raise ValueError("MTP cycle latencies must be positive")
+    if any(
+        accepted < 0 or accepted > speculative_num_steps
+        for accepted in accepted_draft_tokens
+    ):
+        raise ValueError("accepted draft token counts are out of range")
+
+    accepted_draft = sum(accepted_draft_tokens)
+    accepted_tokens = accepted_draft + active_batch_size
+    average_accepted_length = accepted_tokens / active_batch_size
+    return {
+        "active_batch_size": active_batch_size,
+        "accepted_draft_tokens": accepted_draft,
+        "accepted_tokens": accepted_tokens,
+        "average_accepted_length": average_accepted_length,
+        "process_latency_ms": process_latency * 1000,
+        "core_cycle_latency_ms": core_cycle_latency * 1000,
+        "normalized_tpot_ms": (
+            core_cycle_latency / average_accepted_length * 1000
+        ),
+        "throughput_per_dp": accepted_tokens / core_cycle_latency,
+        "draft_acceptance_rate": (
+            accepted_draft / (active_batch_size * speculative_num_steps)
+        ),
+    }
+
+
+def build_mtp_cluster_cycle_metrics(
+    *, unique_dp_accepted_tokens: int, max_core_cycle_latency: float
+) -> dict[str, float | int]:
+    if unique_dp_accepted_tokens < 0:
+        raise ValueError("unique DP accepted tokens must be non-negative")
+    if max_core_cycle_latency <= 0:
+        raise ValueError("max core cycle latency must be positive")
+    return {
+        "cluster_accepted_tokens": unique_dp_accepted_tokens,
+        "cluster_core_cycle_latency_ms": max_core_cycle_latency * 1000,
+        "cluster_throughput": (
+            unique_dp_accepted_tokens / max_core_cycle_latency
+        ),
     }
 
 
@@ -536,6 +739,7 @@ def evaluate_device_wave_admission(
     input_len: int,
     output_len: int,
     page_size: int,
+    speculative_reserve_per_request: int = 0,
 ) -> DeviceAdmissionDecision:
     """Check whether a device-only KV pool can admit the next request wave.
 
@@ -551,12 +755,15 @@ def evaluate_device_wave_admission(
         raise ValueError("input_len and output_len must be positive")
     if page_size <= 0:
         raise ValueError("page_size must be positive")
+    if speculative_reserve_per_request < 0:
+        raise ValueError("speculative_reserve_per_request must be non-negative")
 
     aligned_input_len = _align_up(input_len, page_size)
     aligned_full_len = _align_up(input_len + output_len, page_size)
     next_request_peak = max(aligned_full_len, input_len + page_size)
     required_tokens = (
         ready_count * (aligned_full_len - aligned_input_len) + next_request_peak
+        + (ready_count + 1) * speculative_reserve_per_request
     )
 
     def decision(can_admit: bool, reason: str) -> DeviceAdmissionDecision:

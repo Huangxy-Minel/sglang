@@ -36,6 +36,45 @@ class TestLocalRankAssignments(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "node_rank"):
             bench_utils.get_local_rank_assignments(16, 2, 2)
 
+    def test_worker_ranks_cover_dp16_tp1_and_dp8_tp2(self):
+        dp16 = bench_utils.derive_worker_ranks(
+            tp_rank=7,
+            tp_size=16,
+            dp_size=16,
+            attn_cp_size=1,
+            moe_dp_size=1,
+            ep_size=16,
+            enable_dp_attention=True,
+        )
+        self.assertEqual(dp16.attn_dp_rank, 7)
+        self.assertEqual(dp16.attn_tp_rank, 0)
+        self.assertEqual(dp16.attn_tp_size, 1)
+        self.assertEqual(dp16.moe_ep_rank, 7)
+
+        dp8_tp2_rank0 = bench_utils.derive_worker_ranks(
+            tp_rank=6,
+            tp_size=16,
+            dp_size=8,
+            attn_cp_size=1,
+            moe_dp_size=1,
+            ep_size=16,
+            enable_dp_attention=True,
+        )
+        dp8_tp2_rank1 = bench_utils.derive_worker_ranks(
+            tp_rank=7,
+            tp_size=16,
+            dp_size=8,
+            attn_cp_size=1,
+            moe_dp_size=1,
+            ep_size=16,
+            enable_dp_attention=True,
+        )
+        self.assertEqual(dp8_tp2_rank0.attn_dp_rank, 3)
+        self.assertEqual(dp8_tp2_rank1.attn_dp_rank, 3)
+        self.assertEqual(dp8_tp2_rank0.attn_tp_rank, 0)
+        self.assertEqual(dp8_tp2_rank1.attn_tp_rank, 1)
+        self.assertEqual(dp8_tp2_rank0.attn_tp_size, 2)
+
 
 class TestChunkPlan(unittest.TestCase):
     def test_unspecified_chunk_size_keeps_one_shot_prefill(self):
@@ -230,6 +269,94 @@ class TestDecodeProfilePlan(unittest.TestCase):
                 exit_after_capture=True,
             )
 
+
+class TestMTPHelpers(unittest.TestCase):
+    def test_speculative_slot_reserve_is_page_aligned(self):
+        self.assertEqual(
+            bench_utils.speculative_slot_reserve(
+                num_steps=3,
+                topk=1,
+                num_draft_tokens=4,
+                page_size=64,
+            ),
+            64,
+        )
+        self.assertEqual(
+            bench_utils.speculative_slot_reserve(
+                num_steps=3,
+                topk=4,
+                num_draft_tokens=4,
+                page_size=8,
+            ),
+            16,
+        )
+
+    def test_mtp_cycle_metrics_count_bonus_tokens(self):
+        metrics = bench_utils.build_mtp_cycle_metrics(
+            accepted_draft_tokens=[0, 2, 3],
+            speculative_num_steps=3,
+            process_latency=0.012,
+            core_cycle_latency=0.009,
+        )
+        self.assertEqual(metrics["active_batch_size"], 3)
+        self.assertEqual(metrics["accepted_draft_tokens"], 5)
+        self.assertEqual(metrics["accepted_tokens"], 8)
+        self.assertAlmostEqual(metrics["average_accepted_length"], 8 / 3)
+        self.assertAlmostEqual(metrics["normalized_tpot_ms"], 3.375)
+        self.assertAlmostEqual(metrics["throughput_per_dp"], 8 / 0.009)
+        self.assertAlmostEqual(metrics["draft_acceptance_rate"], 5 / 9)
+
+    def test_cluster_mtp_metrics_use_unique_dp_tokens_and_slowest_rank(self):
+        metrics = bench_utils.build_mtp_cluster_cycle_metrics(
+            unique_dp_accepted_tokens=57,
+            max_core_cycle_latency=0.01,
+        )
+        self.assertEqual(metrics["cluster_accepted_tokens"], 57)
+        self.assertEqual(metrics["cluster_throughput"], 5700)
+
+    def test_draft_inputs_merge_in_wave_order(self):
+        class FakeDraftInput:
+            def __init__(self, values):
+                self.values = list(values)
+
+            def merge_batch(self, other):
+                self.values.extend(other.values)
+
+        merged = bench_utils.merge_speculative_inputs(
+            [FakeDraftInput([0]), FakeDraftInput([1]), FakeDraftInput([2])]
+        )
+        self.assertEqual(merged.values, [0, 1, 2])
+
+    def test_speculative_mode_rejects_unsupported_combinations(self):
+        for kwargs, message in (
+            ({"enable_hisparse": True}, "HiSparse"),
+            ({"correctness_test": True}, "correctness"),
+            (
+                {"profile_enabled": True, "profile_execution_mode": "eager"},
+                "runtime",
+            ),
+            ({"draft_model_path": "/draft"}, "external draft"),
+        ):
+            defaults = dict(
+                spec_algorithm="EAGLE",
+                enable_hisparse=False,
+                correctness_test=False,
+                profile_enabled=False,
+                profile_execution_mode="runtime",
+                model_path="/target",
+                draft_model_path="/target",
+            )
+            defaults.update(kwargs)
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    bench_utils.validate_one_batch_speculative_mode(**defaults)
+
+    def test_exact_output_filter_uses_per_request_lengths(self):
+        self.assertEqual(
+            bench_utils.unfinished_request_indices([128, 125, 128, 127], 128),
+            [1, 3],
+        )
+
     def test_profile_window_rejects_invalid_execution_mode(self):
         with self.assertRaisesRegex(ValueError, "profile execution mode"):
             bench_utils.build_decode_profile_plan(
@@ -361,6 +488,15 @@ class TestClusterMetrics(unittest.TestCase):
 
         self.assertEqual(bench_utils.unique_cuda_storage_bytes(tensors), 5120)
 
+        draft_tensors = [
+            FakeTensor("cuda:0", shared),
+            FakeTensor("cuda:0", FakeStorage(400, 2048)),
+        ]
+        self.assertEqual(
+            bench_utils.exclusive_cuda_storage_bytes(draft_tensors, tensors),
+            2048,
+        )
+
     def test_kv_pool_usage_splits_indexer_without_double_counting(self):
         self.assertEqual(
             bench_utils.split_kv_pool_bytes(1000, 250),
@@ -380,12 +516,15 @@ class TestClusterMetrics(unittest.TestCase):
                 kv_data_bytes=200,
                 kv_indexer_bytes=50,
                 cuda_graph_bytes=100,
+                draft_model_bytes=20,
+                draft_kv_data_bytes=10,
+                draft_kv_indexer_bytes=5,
                 deepep_configured_bytes=80,
             )
         )
 
         self.assertEqual(usage["used_bytes"], 900)
-        self.assertEqual(usage["torch_active_other_bytes"], 50)
+        self.assertEqual(usage["torch_active_other_bytes"], 15)
         self.assertEqual(usage["torch_inactive_cache_bytes"], 100)
         self.assertEqual(usage["native_external_bytes"], 100)
         self.assertEqual(usage["effective_available_bytes"], 200)
@@ -394,6 +533,9 @@ class TestClusterMetrics(unittest.TestCase):
             usage["model_bytes"]
             + usage["kv_data_bytes"]
             + usage["kv_indexer_bytes"]
+            + usage["draft_model_bytes"]
+            + usage["draft_kv_data_bytes"]
+            + usage["draft_kv_indexer_bytes"]
             + usage["torch_active_other_bytes"]
             + usage["native_external_bytes"]
             + usage["effective_available_bytes"],
@@ -790,6 +932,25 @@ class TestUnifiedWaveCapacity(unittest.TestCase):
         self.assertEqual(rejected.stop_reason, "device_pool")
         self.assertEqual(rejected.required_tokens, 4480)
         self.assertTrue(admitted.can_admit)
+
+    def test_device_capacity_adds_speculative_peak_for_all_decode_requests(self):
+        decision = bench_utils.evaluate_device_wave_admission(
+            snapshot=bench_utils.DeviceCapacitySnapshot(
+                device_total=20000,
+                device_available=4671,
+                request_slots_available=8,
+                max_context_len=32768,
+            ),
+            ready_count=2,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            speculative_reserve_per_request=64,
+        )
+
+        self.assertFalse(decision.can_admit)
+        self.assertEqual(decision.required_tokens, 4672)
 
     def test_device_capacity_reports_non_memory_stop_reasons(self):
         common = dict(
