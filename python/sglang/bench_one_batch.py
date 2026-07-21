@@ -83,6 +83,7 @@ from sglang.bench_one_batch_utils import (
     get_local_rank_assignments,
     normalize_profile_activities,
     prepare_chunk_requests,
+    resolve_target_warmup_log_interval,
     resolve_one_batch_cuda_graph_max_bs,
     seed_for_attention_dp_group,
     should_log_prefill_wave,
@@ -233,6 +234,7 @@ class BenchArgs:
     cut_len: int = 4
     log_prefill_wave: int = 0
     log_decode_step: int = 0
+    skip_one_batch_warmup: bool = False
     profile: bool = False
     profile_record_shapes: bool = False
     profile_with_stack: bool = False
@@ -289,6 +291,14 @@ class BenchArgs:
             type=int,
             default=BenchArgs.log_decode_step,
             help="Log decode latency by step, default is set to zero to disable.",
+        )
+        parser.add_argument(
+            "--skip-one-batch-warmup",
+            action="store_true",
+            help=(
+                "Skip the full target-shape one-batch warmup. DeepEP micro "
+                "warmup and model initialization still run."
+            ),
         )
         parser.add_argument("--profile", action="store_true", help="Enable profiling.")
         parser.add_argument(
@@ -831,6 +841,7 @@ class _TorchBenchRunner:
         log_prefill_wave,
         rank_print,
         trace_enabled,
+        phase_label,
     ):
         chunk_plan = build_wave_chunk_plan(
             input_len=input_len,
@@ -867,7 +878,7 @@ class _TorchBenchRunner:
                 )
             suffix = f", stop reason: {final_reason}" if final_reason else ""
             rank_print(
-                f"Prefill wave {progress['wave']}. "
+                f"{phase_label} prefill wave {progress['wave']}. "
                 f"BS/DP: {progress['batch_size']}, "
                 f"global BS: {progress['global_batch_size']}, "
                 f"wave latency: {progress['wave_latency_s']:.5f} s, "
@@ -1499,6 +1510,7 @@ def latency_test_run_once(
     profile_exit_after_capture=False,
     requested_chunked_prefill_size=None,
     report_hbm_usage=False,
+    phase_label="Benchmark",
 ):
     requested_batch_size = batch_size
     is_hisparse = getattr(model_runner, "is_hisparse", False)
@@ -1588,6 +1600,7 @@ def latency_test_run_once(
         log_prefill_wave=log_prefill_wave,
         rank_print=rank_print,
         trace_enabled=enable_profile_prefill,
+        phase_label=phase_label,
     )
     batch_size = wave_prefill["batch_size"]
     measurement_results.update(
@@ -2008,37 +2021,50 @@ def latency_test(
     )
 
     # Warm up
-    rank_print("Warmup ...")
-    try:
-        latency_test_run_once(
-            bench_args.run_name,
-            model_runner,
-            server_args,
-            rank_print,
-            reqs,
-            bench_args.batch_size[0],
-            bench_args.input_len[0],
-            min(
-                32, bench_args.output_len[0]
-            ),  # shorter decoding to speed up the warmup
-            log_prefill_wave=0,
-            log_decode_step=0,
-            profile=False,
-            profile_record_shapes=False,
-            profile_with_stack=False,
-            profile_activities=("CPU", "GPU"),
-            profile_output_dir=None,
-            profile_filename_prefix="",
-            profile_stage="all",
-            tp_rank=tp_rank,
-            profile_start_step=None,
-            profile_steps=None,
-            profile_execution_mode="runtime",
-            profile_exit_after_capture=False,
-            requested_chunked_prefill_size=bench_args.chunked_prefill_size,
+    warmup_log_interval = resolve_target_warmup_log_interval(
+        bench_args.skip_one_batch_warmup, bench_args.log_prefill_wave
+    )
+    if warmup_log_interval is None:
+        rank_print("One-batch target warmup skipped.")
+    else:
+        rank_print(
+            "Warmup ... "
+            f"target BS/DP={bench_args.batch_size[0]}, "
+            f"input_len={bench_args.input_len[0]}, "
+            f"output_len={min(32, bench_args.output_len[0])}"
         )
-    finally:
-        model_runner.cleanup_active_batch()
+        try:
+            latency_test_run_once(
+                bench_args.run_name,
+                model_runner,
+                server_args,
+                rank_print,
+                reqs,
+                bench_args.batch_size[0],
+                bench_args.input_len[0],
+                min(
+                    32, bench_args.output_len[0]
+                ),  # shorter decoding to speed up the warmup
+                log_prefill_wave=warmup_log_interval,
+                log_decode_step=0,
+                profile=False,
+                profile_record_shapes=False,
+                profile_with_stack=False,
+                profile_activities=("CPU", "GPU"),
+                profile_output_dir=None,
+                profile_filename_prefix="",
+                profile_stage="all",
+                tp_rank=tp_rank,
+                profile_start_step=None,
+                profile_steps=None,
+                profile_execution_mode="runtime",
+                profile_exit_after_capture=False,
+                requested_chunked_prefill_size=bench_args.chunked_prefill_size,
+                phase_label="Warmup",
+            )
+        finally:
+            model_runner.cleanup_active_batch()
+        rank_print("One-batch target warmup finished.")
 
     rank_print("Benchmark ...")
 
@@ -2104,6 +2130,7 @@ def latency_test(
                 bench_args.profile_exit_after_capture,
                 bench_args.chunked_prefill_size,
                 report_hbm_usage=True,
+                phase_label="Benchmark",
             )
         finally:
             model_runner.cleanup_active_batch()

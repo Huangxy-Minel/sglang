@@ -307,6 +307,13 @@ def build_deepep_micro_warmup_shape(
     return 1, input_len, 1
 
 
+def resolve_target_warmup_log_interval(
+    skip_target_warmup: bool, log_prefill_wave: int
+) -> Optional[int]:
+    """Return the target-shape warmup log interval, or None when skipped."""
+    return None if skip_target_warmup else log_prefill_wave
+
+
 def get_local_rank_assignments(
     tp_size: int, nnodes: int, node_rank: int
 ) -> list[tuple[int, int]]:

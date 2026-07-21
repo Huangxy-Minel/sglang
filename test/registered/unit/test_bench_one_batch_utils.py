@@ -311,6 +311,25 @@ class TestDeepEPMicroWarmup(unittest.TestCase):
         )
 
 
+class TestTargetWarmupControls(unittest.TestCase):
+    def test_target_warmup_reuses_prefill_log_interval(self):
+        self.assertEqual(
+            bench_utils.resolve_target_warmup_log_interval(
+                skip_target_warmup=False,
+                log_prefill_wave=8,
+            ),
+            8,
+        )
+
+    def test_target_warmup_can_be_skipped_without_disabling_micro_warmup(self):
+        self.assertIsNone(
+            bench_utils.resolve_target_warmup_log_interval(
+                skip_target_warmup=True,
+                log_prefill_wave=8,
+            )
+        )
+
+
 class TestClusterMetrics(unittest.TestCase):
     def test_unique_storage_bytes_deduplicates_shared_cuda_storage(self):
         class FakeStorage:
