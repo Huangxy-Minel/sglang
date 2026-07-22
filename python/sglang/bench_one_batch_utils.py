@@ -595,6 +595,16 @@ def seed_for_attention_dp_group(random_seed: int, attention_dp_rank: int) -> int
     return random_seed + attention_dp_rank
 
 
+def build_mtp_draft_extend_prefix_lens(
+    pre_verify_seq_lens: Sequence[int],
+) -> list[int]:
+    """Snapshot the sequence prefix consumed before an EAGLE verify cycle."""
+    prefix_lens = [int(seq_len) for seq_len in pre_verify_seq_lens]
+    if any(seq_len < 0 for seq_len in prefix_lens):
+        raise ValueError("MTP draft-extend prefix lengths must be non-negative")
+    return prefix_lens
+
+
 def should_log_prefill_wave(
     ready_batch_size: int, log_interval: int, is_final: bool = False
 ) -> bool:

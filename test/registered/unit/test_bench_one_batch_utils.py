@@ -271,6 +271,12 @@ class TestDecodeProfilePlan(unittest.TestCase):
 
 
 class TestMTPHelpers(unittest.TestCase):
+    def test_draft_extend_prefixes_snapshot_pre_verify_sequence_lengths(self):
+        self.assertEqual(
+            bench_utils.build_mtp_draft_extend_prefix_lens([8192, 8193, 8200]),
+            [8192, 8193, 8200],
+        )
+
     def test_fixed_output_length_finishes_only_at_exact_target(self):
         self.assertFalse(
             bench_utils.fixed_output_length_reached(

@@ -78,6 +78,7 @@ from sglang.bench_one_batch_utils import (
     build_mtp_acceptance_accounting,
     build_mtp_cluster_cycle_metrics,
     build_mtp_cycle_metrics,
+    build_mtp_draft_extend_prefix_lens,
     build_profile_trace_filename,
     build_prefill_wave_metrics,
     build_wave_chunk_plan,
@@ -1326,6 +1327,12 @@ class _TorchBenchRunner:
         if active_batch_size:
             batch.prepare_for_decode()
             batch.is_extend_in_batch = False
+            # EAGLE temporarily turns this batch into DRAFT_EXTEND after target
+            # verification. The accepted tokens extend the sequence lengths
+            # captured here, so these are the corresponding draft KV prefixes.
+            batch.prefix_lens = build_mtp_draft_extend_prefix_lens(
+                batch.seq_lens_cpu.tolist()
+            )
         else:
             batch = None
 
