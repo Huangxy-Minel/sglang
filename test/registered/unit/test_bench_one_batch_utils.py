@@ -271,6 +271,36 @@ class TestDecodeProfilePlan(unittest.TestCase):
 
 
 class TestMTPHelpers(unittest.TestCase):
+    def test_mtp_aggregate_metrics_weight_latency_by_active_requests(self):
+        metrics = bench_utils.build_mtp_aggregate_metrics(
+            accepted_tokens=14,
+            raw_accepted_tokens=15,
+            request_cycles=6,
+            request_process_time=0.70,
+            request_core_time=0.64,
+            core_wall_time=0.20,
+            speculative_num_steps=3,
+            dp_size=2,
+        )
+
+        self.assertEqual(
+            set(metrics),
+            {
+                "decode_process_latency_ms",
+                "decode_core_tpot_ms",
+                "decode_throughput_per_dp",
+                "cluster_decode_throughput",
+                "mtp_average_accepted_length",
+                "mtp_draft_acceptance_rate",
+            },
+        )
+        self.assertAlmostEqual(metrics["decode_process_latency_ms"], 700 / 6)
+        self.assertAlmostEqual(metrics["decode_core_tpot_ms"], 640 / 14)
+        self.assertAlmostEqual(metrics["decode_throughput_per_dp"], 35)
+        self.assertAlmostEqual(metrics["cluster_decode_throughput"], 70)
+        self.assertAlmostEqual(metrics["mtp_average_accepted_length"], 14 / 6)
+        self.assertAlmostEqual(metrics["mtp_draft_acceptance_rate"], 0.5)
+
     def test_draft_extend_prefixes_snapshot_pre_verify_sequence_lengths(self):
         self.assertEqual(
             bench_utils.build_mtp_draft_extend_prefix_lens([8192, 8193, 8200]),

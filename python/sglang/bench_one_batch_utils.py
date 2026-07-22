@@ -704,6 +704,53 @@ def build_mtp_cycle_metrics(
     }
 
 
+def build_mtp_aggregate_metrics(
+    *,
+    accepted_tokens: int,
+    raw_accepted_tokens: int,
+    request_cycles: int,
+    request_process_time: float,
+    request_core_time: float,
+    core_wall_time: float,
+    speculative_num_steps: int,
+    dp_size: int,
+) -> dict[str, float | int]:
+    """Aggregate MTP metrics across cycles with changing active batch sizes."""
+    if accepted_tokens <= 0 or request_cycles <= 0:
+        raise ValueError(
+            "MTP aggregate token and request-cycle counts must be positive"
+        )
+    if raw_accepted_tokens < accepted_tokens:
+        raise ValueError("raw MTP acceptance cannot be smaller than committed work")
+    if request_process_time <= 0 or request_core_time <= 0 or core_wall_time <= 0:
+        raise ValueError("MTP aggregate latencies must be positive")
+    if speculative_num_steps <= 0:
+        raise ValueError("speculative_num_steps must be positive")
+    if dp_size <= 0:
+        raise ValueError("dp_size must be positive")
+
+    raw_accepted_draft_tokens = raw_accepted_tokens - request_cycles
+    if raw_accepted_draft_tokens < 0:
+        raise ValueError(
+            "raw MTP accepted tokens must include one bonus token per cycle"
+        )
+
+    cluster_throughput = accepted_tokens / core_wall_time
+    return {
+        "decode_process_latency_ms": (
+            request_process_time / request_cycles * 1000
+        ),
+        "decode_core_tpot_ms": request_core_time / accepted_tokens * 1000,
+        "decode_throughput_per_dp": cluster_throughput / dp_size,
+        "cluster_decode_throughput": cluster_throughput,
+        "mtp_average_accepted_length": accepted_tokens / request_cycles,
+        "mtp_draft_acceptance_rate": (
+            raw_accepted_draft_tokens
+            / (request_cycles * speculative_num_steps)
+        ),
+    }
+
+
 def build_mtp_acceptance_accounting(
     *,
     raw_accepted_draft_before: Sequence[int],

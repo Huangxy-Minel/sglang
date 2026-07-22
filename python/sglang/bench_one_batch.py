@@ -76,6 +76,7 @@ from sglang.bench_one_batch_utils import (
     build_decode_step_metrics,
     build_deepep_micro_warmup_shape,
     build_mtp_acceptance_accounting,
+    build_mtp_aggregate_metrics,
     build_mtp_cluster_cycle_metrics,
     build_mtp_cycle_metrics,
     build_mtp_draft_extend_prefix_lens,
@@ -1889,24 +1890,19 @@ def _run_mtp_decode(
     if any(req.finished() for req in batch.reqs):
         batch.filter_batch(v1_spec_info_filtered=False)
 
-    process_latencies = []
-    normalized_tpots = []
-    cycle_metrics = []
     profiler = None
     profile_started = False
     profile_capture_completed = False
     total_process_latency = 0.0
     total_local_accepted = 0
-    total_local_raw_accepted = 0
-    total_local_trimmed = 0
-    total_local_request_cycles = 0
-    total_local_core_latency = 0.0
     total_cluster_accepted = 0
     total_cluster_raw_accepted = 0
-    total_cluster_trimmed = 0
     total_cluster_request_cycles = 0
+    total_cluster_request_process_time = 0.0
+    total_cluster_request_core_time = 0.0
     total_cluster_core_latency = 0.0
     cycle_index = 0
+    num_cycles = 0
 
     while model_runner.sum_unique_dp(len(batch.reqs)) > 0:
         profile_action = decode_profile_plan.action_for_step(cycle_index)
@@ -1940,19 +1936,15 @@ def _run_mtp_decode(
         ]
         local_accepted_tokens = acceptance["committed_accepted_tokens"]
         local_raw_accepted_tokens = acceptance["raw_accepted_tokens"]
-        local_trimmed_tokens = acceptance["trimmed_tokens"]
         cluster_accepted_tokens = model_runner.sum_unique_dp(
             local_accepted_tokens
         )
         cluster_raw_accepted_tokens = model_runner.sum_unique_dp(
             local_raw_accepted_tokens
         )
-        cluster_trimmed_tokens = model_runner.sum_unique_dp(
-            local_trimmed_tokens
+        max_process_latency, max_core_cycle_latency = model_runner.max_reduce(
+            [process_latency, core_cycle_latency]
         )
-        max_core_cycle_latency = model_runner.max_reduce(
-            [core_cycle_latency]
-        )[0]
         cluster_metrics = build_mtp_cluster_cycle_metrics(
             unique_dp_accepted_tokens=cluster_accepted_tokens,
             max_core_cycle_latency=max_core_cycle_latency,
@@ -1968,85 +1960,50 @@ def _run_mtp_decode(
                 process_latency=process_latency,
                 core_cycle_latency=core_cycle_latency,
             )
-            process_latencies.append(process_latency)
-            normalized_tpots.append(local_metrics["normalized_tpot_ms"] / 1000)
 
         average_accepted_length = (
             cluster_accepted_tokens / global_active_batch_size
         )
-        raw_average_accepted_length = (
-            cluster_raw_accepted_tokens / global_active_batch_size
-        )
         cluster_raw_draft_accepted = (
             cluster_raw_accepted_tokens - global_active_batch_size
         )
-        cluster_committed_draft_accepted = (
-            cluster_accepted_tokens - global_active_batch_size
+        cluster_draft_acceptance_rate = (
+            cluster_raw_draft_accepted
+            / (global_active_batch_size * server_args.speculative_num_steps)
         )
-        cycle = {
-            "cycle": cycle_index,
-            "active_batch_size": active_batch_size,
-            "global_active_batch_size": global_active_batch_size,
-            "local": local_metrics,
-            **cluster_metrics,
-            "cluster_raw_accepted_tokens": cluster_raw_accepted_tokens,
-            "cluster_trimmed_tokens": cluster_trimmed_tokens,
-            "cluster_average_accepted_length": average_accepted_length,
-            "cluster_raw_average_accepted_length": (
-                raw_average_accepted_length
-            ),
-            "cluster_normalized_tpot_ms": (
-                max_core_cycle_latency / average_accepted_length * 1000
-            ),
-            "cluster_draft_acceptance_rate": (
-                cluster_raw_draft_accepted
-                / (global_active_batch_size * server_args.speculative_num_steps)
-            ),
-            "cluster_committed_draft_acceptance_rate": (
-                cluster_committed_draft_accepted
-                / (global_active_batch_size * server_args.speculative_num_steps)
-            ),
-        }
-        cycle_metrics.append(cycle)
         total_process_latency += process_latency
-        total_local_request_cycles += active_batch_size
         total_local_accepted += local_accepted_tokens
-        total_local_raw_accepted += local_raw_accepted_tokens
-        total_local_trimmed += local_trimmed_tokens
-        if active_batch_size:
-            total_local_core_latency += core_cycle_latency
         total_cluster_accepted += cluster_accepted_tokens
         total_cluster_raw_accepted += cluster_raw_accepted_tokens
-        total_cluster_trimmed += cluster_trimmed_tokens
         total_cluster_core_latency += max_core_cycle_latency
         total_cluster_request_cycles += global_active_batch_size
+        total_cluster_request_process_time += (
+            global_active_batch_size * max_process_latency
+        )
+        total_cluster_request_core_time += (
+            global_active_batch_size * max_core_cycle_latency
+        )
+        num_cycles += 1
 
         if cycle_index < 5 or (
             log_decode_step > 0 and cycle_index % log_decode_step == 0
         ):
             local_text = (
-                f"normalized TPOT: {local_metrics['normalized_tpot_ms']:.3f} "
+                f"core TPOT: {local_metrics['normalized_tpot_ms']:.3f} "
                 f"ms/token, throughput/DP: "
                 f"{local_metrics['throughput_per_dp']:.2f} token/s, "
-                f"avg accepted: "
-                f"{local_metrics['average_accepted_length']:.2f}, "
-                f"raw avg accepted: "
-                f"{local_metrics['raw_average_accepted_length']:.2f}, "
-                f"trimmed: {local_metrics['trimmed_tokens']}, "
-                f"raw draft acceptance: "
-                f"{local_metrics['draft_acceptance_rate']:.2%}, "
                 if local_metrics is not None
                 else "local DP idle, "
             )
             rank_print(
                 f"MTP decode {cycle_index}. BS/DP: {active_batch_size}, "
-                f"global active BS: {global_active_batch_size}, "
+                f"global BS: {global_active_batch_size}, "
                 f"process latency: {process_latency * 1000:.3f} ms, "
                 + local_text
-                + f"cluster normalized TPOT: "
-                f"{cycle['cluster_normalized_tpot_ms']:.3f} ms/token, "
-                f"cluster throughput: "
-                f"{cluster_metrics['cluster_throughput']:.2f} token/s"
+                + f"cluster throughput: "
+                f"{cluster_metrics['cluster_throughput']:.2f} token/s, "
+                f"avg accepted: {average_accepted_length:.2f}, "
+                f"draft acceptance: {cluster_draft_acceptance_rate:.2%}"
             )
 
         if profile_owner and profile_started and (
@@ -2110,19 +2067,16 @@ def _run_mtp_decode(
 
     return {
         "batch": batch,
-        "process_latencies": process_latencies,
-        "normalized_tpots": normalized_tpots,
-        "cycles": cycle_metrics,
+        "num_cycles": num_cycles,
         "total_process_latency": total_process_latency,
         "total_local_accepted_tokens": total_local_accepted,
-        "total_local_raw_accepted_tokens": total_local_raw_accepted,
-        "total_local_trimmed_tokens": total_local_trimmed,
-        "total_local_request_cycles": total_local_request_cycles,
-        "total_local_core_latency": total_local_core_latency,
         "total_cluster_accepted_tokens": total_cluster_accepted,
         "total_cluster_raw_accepted_tokens": total_cluster_raw_accepted,
-        "total_cluster_trimmed_tokens": total_cluster_trimmed,
         "total_cluster_request_cycles": total_cluster_request_cycles,
+        "total_cluster_request_process_time": (
+            total_cluster_request_process_time
+        ),
+        "total_cluster_request_core_time": total_cluster_request_core_time,
         "total_cluster_core_latency": total_cluster_core_latency,
         "profile_capture_completed": profile_capture_completed,
         "decode_completed": decode_completed,
@@ -2372,78 +2326,36 @@ def latency_test_run_once(
             batch_size=batch_size,
         )
         batch = mtp_decode_result["batch"]
-        decode_process_latencies = mtp_decode_result["process_latencies"]
-        core_forward_tpots = mtp_decode_result["normalized_tpots"]
         profile_capture_completed = mtp_decode_result[
             "profile_capture_completed"
         ]
         tot_latency += mtp_decode_result["total_process_latency"]
-        local_core_latency = mtp_decode_result["total_local_core_latency"]
-        cluster_core_latency = mtp_decode_result["total_cluster_core_latency"]
         decode_tokens_per_req = max(output_len - 1, 0)
         expected_local_decode_tokens = batch_size * decode_tokens_per_req
         expected_cluster_decode_tokens = (
             expected_local_decode_tokens * server_args.dp_size
         )
-        measurement_results.update(
-            {
-                "mtp_cycles": mtp_decode_result["cycles"],
-                "mtp_decode_completed": mtp_decode_result["decode_completed"],
-                "mtp_expected_decode_tokens_per_dp": (
-                    expected_local_decode_tokens
-                ),
-                "mtp_expected_cluster_decode_tokens": (
-                    expected_cluster_decode_tokens
-                ),
-                "mtp_total_accepted_tokens_per_dp": mtp_decode_result[
-                    "total_local_accepted_tokens"
-                ],
-                "mtp_total_raw_accepted_tokens_per_dp": mtp_decode_result[
-                    "total_local_raw_accepted_tokens"
-                ],
-                "mtp_total_trimmed_tokens_per_dp": mtp_decode_result[
-                    "total_local_trimmed_tokens"
-                ],
-                "mtp_total_cluster_accepted_tokens": mtp_decode_result[
-                    "total_cluster_accepted_tokens"
-                ],
-                "mtp_total_cluster_raw_accepted_tokens": mtp_decode_result[
-                    "total_cluster_raw_accepted_tokens"
-                ],
-                "mtp_total_cluster_trimmed_tokens": mtp_decode_result[
-                    "total_cluster_trimmed_tokens"
-                ],
-                "mtp_average_cycles_per_request": (
-                    mtp_decode_result["total_local_request_cycles"] / batch_size
-                ),
-                "mtp_cluster_average_cycles_per_request": (
-                    mtp_decode_result["total_cluster_request_cycles"]
-                    / (batch_size * server_args.dp_size)
-                ),
-                "mtp_decode_core_tpot_ms": (
-                    local_core_latency / decode_tokens_per_req * 1000
-                    if decode_tokens_per_req > 0
-                    else 0.0
-                ),
-                "mtp_cluster_decode_core_tpot_ms": (
-                    cluster_core_latency / decode_tokens_per_req * 1000
-                    if decode_tokens_per_req > 0
-                    else 0.0
-                ),
-                "mtp_decode_throughput_per_dp": (
-                    mtp_decode_result["total_local_accepted_tokens"]
-                    / local_core_latency
-                    if local_core_latency > 0
-                    else 0.0
-                ),
-                "mtp_cluster_decode_throughput": (
-                    mtp_decode_result["total_cluster_accepted_tokens"]
-                    / cluster_core_latency
-                    if cluster_core_latency > 0
-                    else 0.0
-                ),
-            }
+        mtp_aggregate_metrics = build_mtp_aggregate_metrics(
+            accepted_tokens=mtp_decode_result[
+                "total_cluster_accepted_tokens"
+            ],
+            raw_accepted_tokens=mtp_decode_result[
+                "total_cluster_raw_accepted_tokens"
+            ],
+            request_cycles=mtp_decode_result[
+                "total_cluster_request_cycles"
+            ],
+            request_process_time=mtp_decode_result[
+                "total_cluster_request_process_time"
+            ],
+            request_core_time=mtp_decode_result[
+                "total_cluster_request_core_time"
+            ],
+            core_wall_time=mtp_decode_result["total_cluster_core_latency"],
+            speculative_num_steps=server_args.speculative_num_steps,
+            dp_size=server_args.dp_size,
         )
+        measurement_results.update(mtp_aggregate_metrics)
 
     for i in (() if is_mtp else range(output_len - 1)):
         profile_action = decode_profile_plan.action_for_step(i)
@@ -2555,7 +2467,7 @@ def latency_test_run_once(
         )
 
     measurement_results["executed_decode_steps"] = (
-        len(mtp_decode_result["cycles"])
+        mtp_decode_result["num_cycles"]
         if mtp_decode_result is not None
         else len(decode_process_latencies)
     )
@@ -2580,85 +2492,43 @@ def latency_test_run_once(
     # Record full decode process latency and core model-forward TPOT.
     med_decode_latency = None
     med_core_forward_tpot = None
-    if decode_process_latencies:
+    if not is_mtp and decode_process_latencies:
         med_decode_latency = float(np.median(decode_process_latencies))
         med_core_forward_tpot = float(np.median(core_forward_tpots))
-        if is_mtp:
-            local_cycles = [
-                cycle["local"]
-                for cycle in mtp_decode_result["cycles"]
-                if cycle["local"] is not None
-            ]
-            median_throughput_per_dp = float(
-                np.median([cycle["throughput_per_dp"] for cycle in local_cycles])
-            )
-            median_cluster_throughput = float(
-                np.median(
-                    [
-                        cycle["cluster_throughput"]
-                        for cycle in mtp_decode_result["cycles"]
-                    ]
-                )
-            )
-            rank_print(
-                f"MTP decode median. initial BS/DP: {batch_size}, "
-                f"process latency: {med_decode_latency * 1000:.3f} ms, "
-                f"normalized TPOT: {med_core_forward_tpot * 1000:.3f} "
-                f"ms/token, throughput/DP: "
-                f"{median_throughput_per_dp:.2f} token/s, "
-                f"cluster throughput: {median_cluster_throughput:.2f} token/s"
-            )
-            measurement_results.update(
-                {
-                    "median_decode_latency": med_decode_latency,
-                    "median_decode_latency_ms": med_decode_latency * 1000,
-                    "median_core_forward_tpot": med_core_forward_tpot,
-                    "median_core_forward_tpot_ms": med_core_forward_tpot * 1000,
-                    "median_decode_tpot_ms": med_core_forward_tpot * 1000,
-                    "median_decode_throughput": median_throughput_per_dp,
-                    "median_decode_throughput_per_dp": (
-                        median_throughput_per_dp
-                    ),
-                    "mtp_median_cluster_throughput": (
-                        median_cluster_throughput
-                    ),
-                }
-            )
-        else:
-            med_decode_metrics = build_decode_step_metrics(
-                batch_size=batch_size,
-                dp_size=server_args.dp_size,
-                process_latency=med_decode_latency,
-                core_forward_tpot=med_core_forward_tpot,
-            )
-            rank_print(
-                f"Decode median. BS/DP: {batch_size}, "
-                f"global BS: {batch_size * server_args.dp_size}, "
-                f"process latency: "
-                f"{med_decode_metrics['process_latency_ms']:.3f} ms, "
-                f"core TPOT: {med_decode_metrics['tpot_ms']:.3f} ms/token, "
-                f"throughput/DP: "
-                f"{med_decode_metrics['throughput_per_dp']:.2f} token/s, "
-                f"cluster throughput (est.): "
-                f"{med_decode_metrics['cluster_throughput']:.2f} token/s"
-            )
-            measurement_results["median_decode_latency"] = med_decode_latency
-            measurement_results["median_decode_latency_ms"] = med_decode_metrics[
-                "process_latency_ms"
-            ]
-            measurement_results["median_core_forward_tpot"] = med_core_forward_tpot
-            measurement_results["median_core_forward_tpot_ms"] = med_decode_metrics[
-                "tpot_ms"
-            ]
-            measurement_results["median_decode_tpot_ms"] = med_decode_metrics[
-                "tpot_ms"
-            ]
-            measurement_results["median_decode_throughput"] = med_decode_metrics[
-                "throughput_per_dp"
-            ]
-            measurement_results["median_decode_throughput_per_dp"] = (
-                med_decode_metrics["throughput_per_dp"]
-            )
+        med_decode_metrics = build_decode_step_metrics(
+            batch_size=batch_size,
+            dp_size=server_args.dp_size,
+            process_latency=med_decode_latency,
+            core_forward_tpot=med_core_forward_tpot,
+        )
+        rank_print(
+            f"Decode median. BS/DP: {batch_size}, "
+            f"global BS: {batch_size * server_args.dp_size}, "
+            f"process latency: "
+            f"{med_decode_metrics['process_latency_ms']:.3f} ms, "
+            f"core TPOT: {med_decode_metrics['tpot_ms']:.3f} ms/token, "
+            f"throughput/DP: "
+            f"{med_decode_metrics['throughput_per_dp']:.2f} token/s, "
+            f"cluster throughput (est.): "
+            f"{med_decode_metrics['cluster_throughput']:.2f} token/s"
+        )
+        measurement_results["median_decode_latency"] = med_decode_latency
+        measurement_results["median_decode_latency_ms"] = med_decode_metrics[
+            "process_latency_ms"
+        ]
+        measurement_results["median_core_forward_tpot"] = med_core_forward_tpot
+        measurement_results["median_core_forward_tpot_ms"] = med_decode_metrics[
+            "tpot_ms"
+        ]
+        measurement_results["median_decode_tpot_ms"] = med_decode_metrics[
+            "tpot_ms"
+        ]
+        measurement_results["median_decode_throughput"] = med_decode_metrics[
+            "throughput_per_dp"
+        ]
+        measurement_results["median_decode_throughput_per_dp"] = (
+            med_decode_metrics["throughput_per_dp"]
+        )
 
     if measurement_results.get("profile_early_exit", False):
         rank_print(
@@ -2672,52 +2542,47 @@ def latency_test_run_once(
 
     if is_mtp:
         model_runner.assert_exact_output_len(output_len)
-        if not measurement_results["mtp_decode_completed"]:
+        if not mtp_decode_result["decode_completed"]:
             raise RuntimeError(
                 "one-batch MTP decode ended before all requests finished"
             )
         if (
-            measurement_results["mtp_total_accepted_tokens_per_dp"]
-            != measurement_results["mtp_expected_decode_tokens_per_dp"]
+            mtp_decode_result["total_local_accepted_tokens"]
+            != expected_local_decode_tokens
         ):
             raise RuntimeError(
                 "one-batch MTP committed-token accounting does not match the "
                 "fixed output length: "
-                f"committed={measurement_results['mtp_total_accepted_tokens_per_dp']}, "
-                f"expected={measurement_results['mtp_expected_decode_tokens_per_dp']}"
+                f"committed={mtp_decode_result['total_local_accepted_tokens']}, "
+                f"expected={expected_local_decode_tokens}"
             )
         if (
-            measurement_results["mtp_total_cluster_accepted_tokens"]
-            != measurement_results["mtp_expected_cluster_decode_tokens"]
+            mtp_decode_result["total_cluster_accepted_tokens"]
+            != expected_cluster_decode_tokens
         ):
             raise RuntimeError(
                 "one-batch MTP cluster committed-token accounting does not match "
                 "the fixed output length: "
                 "committed="
-                f"{measurement_results['mtp_total_cluster_accepted_tokens']}, "
-                f"expected={measurement_results['mtp_expected_cluster_decode_tokens']}"
+                f"{mtp_decode_result['total_cluster_accepted_tokens']}, "
+                f"expected={expected_cluster_decode_tokens}"
             )
         rank_print(
-            "MTP decode aggregate. "
-            f"accepted tokens/DP: "
-            f"{measurement_results['mtp_total_accepted_tokens_per_dp']}, "
-            f"raw accepted tokens/DP: "
-            f"{measurement_results['mtp_total_raw_accepted_tokens_per_dp']}, "
-            f"trimmed tokens/DP: "
-            f"{measurement_results['mtp_total_trimmed_tokens_per_dp']}, "
-            f"avg cycles/request: "
-            f"{measurement_results['mtp_average_cycles_per_request']:.2f}, "
+            "MTP decode summary. "
+            f"BS/DP: {batch_size}, "
+            f"global BS: {batch_size * server_args.dp_size}, "
+            f"process latency: "
+            f"{measurement_results['decode_process_latency_ms']:.3f} ms, "
             f"core TPOT: "
-            f"{measurement_results['mtp_decode_core_tpot_ms']:.3f} ms/token, "
+            f"{measurement_results['decode_core_tpot_ms']:.3f} ms/token, "
             f"throughput/DP: "
-            f"{measurement_results['mtp_decode_throughput_per_dp']:.2f} "
-            f"token/s, cluster accepted tokens: "
-            f"{measurement_results['mtp_total_cluster_accepted_tokens']}, "
-            f"cluster core TPOT: "
-            f"{measurement_results['mtp_cluster_decode_core_tpot_ms']:.3f} "
-            f"ms/token, "
+            f"{measurement_results['decode_throughput_per_dp']:.2f} token/s, "
             f"cluster throughput: "
-            f"{measurement_results['mtp_cluster_decode_throughput']:.2f} token/s"
+            f"{measurement_results['cluster_decode_throughput']:.2f} token/s, "
+            f"avg accepted: "
+            f"{measurement_results['mtp_average_accepted_length']:.2f}, "
+            f"draft acceptance: "
+            f"{measurement_results['mtp_draft_acceptance_rate']:.2%}"
         )
 
     throughput = (input_len + output_len) * batch_size / tot_latency
@@ -2751,13 +2616,6 @@ def latency_test_run_once(
         cluster_median_core_forward_tpot=cluster_median_core_forward_tpot,
         cluster_total_latency=cluster_total_latency,
     )
-    if is_mtp and med_decode_latency is not None:
-        cluster_metrics["cluster_median_decode_throughput_per_dp"] = (
-            measurement_results["median_decode_throughput_per_dp"]
-        )
-        cluster_metrics["cluster_median_decode_throughput"] = (
-            measurement_results["mtp_median_cluster_throughput"]
-        )
     measurement_results.update(cluster_metrics)
     rank_print(
         "Cluster. "
@@ -2766,15 +2624,14 @@ def latency_test_run_once(
         f"total latency: {cluster_metrics['cluster_total_latency']:6.3f} s, "
         f"overall throughput: {cluster_metrics['cluster_overall_throughput']:9.2f} token/s"
     )
-    if "cluster_median_decode_latency" in cluster_metrics:
-        tpot_label = "normalized TPOT" if is_mtp else "core TPOT"
+    if not is_mtp and "cluster_median_decode_latency" in cluster_metrics:
         rank_print(
             "Cluster decode. "
             f"BS/DP: {batch_size}, "
             f"global BS: {cluster_metrics['global_batch_size']}, "
             f"process latency: "
             f"{cluster_metrics['cluster_median_decode_latency_ms']:.3f} ms, "
-            f"{tpot_label}: "
+            f"core TPOT: "
             f"{cluster_metrics['cluster_median_core_forward_tpot_ms']:.3f} ms/token, "
             f"throughput/DP: "
             f"{cluster_metrics['cluster_median_decode_throughput_per_dp']:.2f} token/s, "
