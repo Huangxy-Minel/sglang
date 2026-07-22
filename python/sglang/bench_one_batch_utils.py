@@ -849,6 +849,16 @@ def evaluate_hisparse_wave_admission(
     return decision(True, "admitted")
 
 
+def initialize_request_vocab_size(reqs, vocab_size: Optional[int]):
+    """Attach target-model vocabulary metadata before finish checks run."""
+    if vocab_size is None or int(vocab_size) <= 0:
+        raise ValueError("target model vocab_size must be a positive integer")
+    vocab_size = int(vocab_size)
+    for req in reqs:
+        req.vocab_size = vocab_size
+    return reqs
+
+
 def prepare_chunk_requests(
     reqs,
     full_input_ids: Sequence[Sequence[int]],

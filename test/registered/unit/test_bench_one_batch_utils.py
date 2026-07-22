@@ -76,6 +76,22 @@ class TestLocalRankAssignments(unittest.TestCase):
         self.assertEqual(dp8_tp2_rank0.attn_tp_size, 2)
 
 
+class TestRequestModelMetadata(unittest.TestCase):
+    def test_request_vocab_size_is_initialized_from_target_model(self):
+        class FakeReq:
+            vocab_size = None
+
+        reqs = [FakeReq(), FakeReq()]
+        result = bench_utils.initialize_request_vocab_size(reqs, 131072)
+
+        self.assertIs(result, reqs)
+        self.assertEqual([req.vocab_size for req in reqs], [131072, 131072])
+
+    def test_missing_target_vocab_size_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "target model vocab_size"):
+            bench_utils.initialize_request_vocab_size([], None)
+
+
 class TestChunkPlan(unittest.TestCase):
     def test_unspecified_chunk_size_keeps_one_shot_prefill(self):
         plan = bench_utils.build_chunk_plan(

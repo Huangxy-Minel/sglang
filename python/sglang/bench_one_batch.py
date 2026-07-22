@@ -85,6 +85,7 @@ from sglang.bench_one_batch_utils import (
     evaluate_hisparse_wave_admission,
     exclusive_cuda_storage_bytes,
     get_local_rank_assignments,
+    initialize_request_vocab_size,
     merge_speculative_inputs,
     normalize_profile_activities,
     prepare_chunk_requests,
@@ -1034,6 +1035,9 @@ class _TorchBenchRunner:
         trace_enabled,
         phase_label,
     ):
+        initialize_request_vocab_size(
+            reqs, self.torch_runner.model_config.vocab_size
+        )
         chunk_plan = build_wave_chunk_plan(
             input_len=input_len,
             requested_chunk_size=requested_chunk_size,
