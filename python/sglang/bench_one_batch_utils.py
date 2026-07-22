@@ -626,11 +626,17 @@ def build_decode_step_metrics(
 def build_mtp_cycle_metrics(
     *,
     accepted_draft_tokens: Sequence[int],
+    raw_accepted_draft_tokens: Optional[Sequence[int]] = None,
     speculative_num_steps: int,
     process_latency: float,
     core_cycle_latency: float,
 ) -> dict[str, float | int]:
-    """Build metrics for one synchronous draft/verify/commit/extend cycle."""
+    """Build metrics for one synchronous draft/verify/commit/extend cycle.
+
+    ``accepted_draft_tokens`` contains tokens retained by the benchmark after
+    fixed-length clipping. ``raw_accepted_draft_tokens`` contains the verify
+    result before clipping and is used only for acceptance diagnostics.
+    """
     active_batch_size = len(accepted_draft_tokens)
     if active_batch_size <= 0:
         raise ValueError("an MTP cycle must contain at least one active request")
@@ -643,15 +649,35 @@ def build_mtp_cycle_metrics(
         for accepted in accepted_draft_tokens
     ):
         raise ValueError("accepted draft token counts are out of range")
+    if raw_accepted_draft_tokens is None:
+        raw_accepted_draft_tokens = accepted_draft_tokens
+    if len(raw_accepted_draft_tokens) != active_batch_size:
+        raise ValueError("raw and committed acceptance counts must have equal length")
+    if any(
+        raw < committed or raw > speculative_num_steps
+        for raw, committed in zip(
+            raw_accepted_draft_tokens, accepted_draft_tokens
+        )
+    ):
+        raise ValueError("raw accepted draft token counts are out of range")
 
     accepted_draft = sum(accepted_draft_tokens)
+    raw_accepted_draft = sum(raw_accepted_draft_tokens)
     accepted_tokens = accepted_draft + active_batch_size
+    raw_accepted_tokens = raw_accepted_draft + active_batch_size
+    trimmed_tokens = raw_accepted_draft - accepted_draft
     average_accepted_length = accepted_tokens / active_batch_size
     return {
         "active_batch_size": active_batch_size,
         "accepted_draft_tokens": accepted_draft,
         "accepted_tokens": accepted_tokens,
+        "raw_accepted_draft_tokens": raw_accepted_draft,
+        "raw_accepted_tokens": raw_accepted_tokens,
+        "trimmed_tokens": trimmed_tokens,
         "average_accepted_length": average_accepted_length,
+        "raw_average_accepted_length": (
+            raw_accepted_tokens / active_batch_size
+        ),
         "process_latency_ms": process_latency * 1000,
         "core_cycle_latency_ms": core_cycle_latency * 1000,
         "normalized_tpot_ms": (
@@ -659,9 +685,76 @@ def build_mtp_cycle_metrics(
         ),
         "throughput_per_dp": accepted_tokens / core_cycle_latency,
         "draft_acceptance_rate": (
+            raw_accepted_draft
+            / (active_batch_size * speculative_num_steps)
+        ),
+        "committed_draft_acceptance_rate": (
             accepted_draft / (active_batch_size * speculative_num_steps)
         ),
     }
+
+
+def build_mtp_acceptance_accounting(
+    *,
+    raw_accepted_draft_before: Sequence[int],
+    raw_accepted_draft_after: Sequence[int],
+    committed_accepted_draft_tokens: Sequence[int],
+) -> dict[str, tuple[int, ...] | int]:
+    """Separate raw EAGLE acceptance from fixed-length committed work."""
+    if not (
+        len(raw_accepted_draft_before)
+        == len(raw_accepted_draft_after)
+        == len(committed_accepted_draft_tokens)
+    ):
+        raise ValueError("MTP acceptance vectors must have equal length")
+
+    raw_per_req = tuple(
+        after - before
+        for before, after in zip(
+            raw_accepted_draft_before, raw_accepted_draft_after
+        )
+    )
+    committed_per_req = tuple(committed_accepted_draft_tokens)
+    if any(raw < 0 for raw in raw_per_req):
+        raise ValueError("raw MTP acceptance counters must be monotonic")
+    if any(committed < 0 for committed in committed_per_req):
+        raise ValueError("committed MTP acceptance counts must be non-negative")
+    if any(
+        committed > raw
+        for raw, committed in zip(raw_per_req, committed_per_req)
+    ):
+        raise ValueError("committed MTP acceptance cannot exceed raw acceptance")
+
+    trimmed_per_req = tuple(
+        raw - committed
+        for raw, committed in zip(raw_per_req, committed_per_req)
+    )
+    active_batch_size = len(raw_per_req)
+    return {
+        "raw_accepted_draft_tokens_per_req": raw_per_req,
+        "committed_accepted_draft_tokens_per_req": committed_per_req,
+        "trimmed_tokens_per_req": trimmed_per_req,
+        "raw_accepted_tokens": sum(raw_per_req) + active_batch_size,
+        "committed_accepted_tokens": (
+            sum(committed_per_req) + active_batch_size
+        ),
+        "trimmed_tokens": sum(trimmed_per_req),
+    }
+
+
+def fixed_output_length_reached(
+    *, current_output_len: int, target_output_len: int
+) -> bool:
+    """Return whether a fixed-length benchmark request is exactly complete."""
+    if target_output_len <= 0:
+        raise ValueError("target output length must be positive")
+    if current_output_len < 0:
+        raise ValueError("current output length must be non-negative")
+    if current_output_len > target_output_len:
+        raise RuntimeError(
+            "fixed-length benchmark request exceeded its target output length"
+        )
+    return current_output_len == target_output_len
 
 
 def build_mtp_cluster_cycle_metrics(
@@ -847,16 +940,6 @@ def evaluate_hisparse_wave_admission(
     if snapshot.host_available < requirements.host_for_next_wave:
         return decision(False, "host_pool")
     return decision(True, "admitted")
-
-
-def initialize_request_vocab_size(reqs, vocab_size: Optional[int]):
-    """Attach target-model vocabulary metadata before finish checks run."""
-    if vocab_size is None or int(vocab_size) <= 0:
-        raise ValueError("target model vocab_size must be a positive integer")
-    vocab_size = int(vocab_size)
-    for req in reqs:
-        req.vocab_size = vocab_size
-    return reqs
 
 
 def prepare_chunk_requests(

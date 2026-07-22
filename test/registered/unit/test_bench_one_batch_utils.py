@@ -76,22 +76,6 @@ class TestLocalRankAssignments(unittest.TestCase):
         self.assertEqual(dp8_tp2_rank0.attn_tp_size, 2)
 
 
-class TestRequestModelMetadata(unittest.TestCase):
-    def test_request_vocab_size_is_initialized_from_target_model(self):
-        class FakeReq:
-            vocab_size = None
-
-        reqs = [FakeReq(), FakeReq()]
-        result = bench_utils.initialize_request_vocab_size(reqs, 131072)
-
-        self.assertIs(result, reqs)
-        self.assertEqual([req.vocab_size for req in reqs], [131072, 131072])
-
-    def test_missing_target_vocab_size_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "target model vocab_size"):
-            bench_utils.initialize_request_vocab_size([], None)
-
-
 class TestChunkPlan(unittest.TestCase):
     def test_unspecified_chunk_size_keeps_one_shot_prefill(self):
         plan = bench_utils.build_chunk_plan(
@@ -287,6 +271,38 @@ class TestDecodeProfilePlan(unittest.TestCase):
 
 
 class TestMTPHelpers(unittest.TestCase):
+    def test_fixed_output_length_finishes_only_at_exact_target(self):
+        self.assertFalse(
+            bench_utils.fixed_output_length_reached(
+                current_output_len=127, target_output_len=128
+            )
+        )
+        self.assertTrue(
+            bench_utils.fixed_output_length_reached(
+                current_output_len=128, target_output_len=128
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "exceeded"):
+            bench_utils.fixed_output_length_reached(
+                current_output_len=129, target_output_len=128
+            )
+
+    def test_mtp_acceptance_accounting_tracks_trimmed_tokens(self):
+        accounting = bench_utils.build_mtp_acceptance_accounting(
+            raw_accepted_draft_before=[5, 9],
+            raw_accepted_draft_after=[8, 10],
+            committed_accepted_draft_tokens=[1, 1],
+        )
+
+        self.assertEqual(accounting["raw_accepted_draft_tokens_per_req"], (3, 1))
+        self.assertEqual(
+            accounting["committed_accepted_draft_tokens_per_req"], (1, 1)
+        )
+        self.assertEqual(accounting["trimmed_tokens_per_req"], (2, 0))
+        self.assertEqual(accounting["raw_accepted_tokens"], 6)
+        self.assertEqual(accounting["committed_accepted_tokens"], 4)
+        self.assertEqual(accounting["trimmed_tokens"], 2)
+
     def test_speculative_slot_reserve_is_page_aligned(self):
         self.assertEqual(
             bench_utils.speculative_slot_reserve(
@@ -321,6 +337,22 @@ class TestMTPHelpers(unittest.TestCase):
         self.assertAlmostEqual(metrics["normalized_tpot_ms"], 3.375)
         self.assertAlmostEqual(metrics["throughput_per_dp"], 8 / 0.009)
         self.assertAlmostEqual(metrics["draft_acceptance_rate"], 5 / 9)
+
+    def test_mtp_cycle_metrics_use_committed_tokens_for_throughput(self):
+        metrics = bench_utils.build_mtp_cycle_metrics(
+            accepted_draft_tokens=[1, 1],
+            raw_accepted_draft_tokens=[3, 1],
+            speculative_num_steps=3,
+            process_latency=0.012,
+            core_cycle_latency=0.01,
+        )
+
+        self.assertEqual(metrics["accepted_tokens"], 4)
+        self.assertEqual(metrics["raw_accepted_tokens"], 6)
+        self.assertEqual(metrics["trimmed_tokens"], 2)
+        self.assertAlmostEqual(metrics["throughput_per_dp"], 400.0)
+        self.assertAlmostEqual(metrics["draft_acceptance_rate"], 4 / 6)
+        self.assertAlmostEqual(metrics["committed_draft_acceptance_rate"], 2 / 6)
 
     def test_cluster_mtp_metrics_use_unique_dp_tokens_and_slowest_rank(self):
         metrics = bench_utils.build_mtp_cluster_cycle_metrics(
