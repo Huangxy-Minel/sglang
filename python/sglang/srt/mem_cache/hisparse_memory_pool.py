@@ -10,6 +10,9 @@ from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.hisparse_allocator_transaction import (
+    HiSparseAllocatorTransaction,
+)
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -138,6 +141,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.device = device
         self.page_size = page_size
         self.need_sort = need_sort
+        self._active_transaction: Optional[HiSparseAllocatorTransaction] = None
 
         self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_full,
@@ -187,6 +191,26 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
         )
+
+    def backup_state(self) -> HiSparseAllocatorTransaction:
+        if self._active_transaction is not None:
+            raise RuntimeError("Nested HiSparse allocator transactions are unsupported")
+        state = HiSparseAllocatorTransaction(
+            logical_state=self.logical_attn_allocator.backup_state(),
+            hot_state=self.hisparse_attn_allocator.backup_state(),
+        )
+        self._active_transaction = state
+        return state
+
+    def restore_state(self, state: HiSparseAllocatorTransaction) -> None:
+        if state is not self._active_transaction:
+            raise RuntimeError("Cannot restore an inactive HiSparse allocator state")
+        try:
+            state.restore_mapping(self.full_to_hisparse_device_index_mapping)
+            self.logical_attn_allocator.restore_state(state.logical_state)
+            self.hisparse_attn_allocator.restore_state(state.hot_state)
+        finally:
+            self._active_transaction = None
 
     def alloc(self, need_size: int):
         raise NotImplementedError(
@@ -301,6 +325,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             hisparse_indices is not None
         ), "Hisparse allocation failed in alloc_extend"
 
+        if self._active_transaction is not None:
+            self._active_transaction.record_mapping_update(
+                self.full_to_hisparse_device_index_mapping,
+                logical_indices,
+            )
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
 
         return logical_indices
@@ -348,6 +377,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
 
     def clear(self):
+        self._active_transaction = None
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
 

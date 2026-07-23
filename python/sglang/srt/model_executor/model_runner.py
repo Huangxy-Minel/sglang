@@ -307,6 +307,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        enable_hisparse_override: Optional[bool] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -346,7 +347,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = (
+            server_args.enable_hisparse
+            if enable_hisparse_override is None
+            else enable_hisparse_override
+        )
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""

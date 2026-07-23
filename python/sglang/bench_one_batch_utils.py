@@ -66,11 +66,19 @@ class HiSparseCapacitySnapshot:
 
 
 @dataclass(frozen=True)
+class DraftCapacitySnapshot:
+    total: int
+    available: int
+
+
+@dataclass(frozen=True)
 class HiSparseCapacityRequirements:
     hot_per_ready_request: int
     hot_prefill_peak: int
+    hot_decode_for_next_wave: int
     logical_for_next_wave: int
     host_for_next_wave: int
+    draft_for_next_wave: int
 
 
 @dataclass(frozen=True)
@@ -579,8 +587,6 @@ def validate_one_batch_speculative_mode(
         return
     if spec_algorithm.upper() != "EAGLE":
         raise ValueError("one-batch speculative decoding currently supports EAGLE only")
-    if enable_hisparse:
-        raise ValueError("one-batch MTP does not yet support HiSparse")
     if correctness_test:
         raise ValueError("one-batch MTP does not support correctness mode")
     if profile_enabled and profile_execution_mode != "runtime":
@@ -860,7 +866,9 @@ def _pool_usage(total: int, available: int) -> dict[str, int | float]:
 
 
 def build_capacity_usage(
-    snapshot: DeviceCapacitySnapshot | HiSparseCapacitySnapshot,
+    snapshot: (
+        DeviceCapacitySnapshot | HiSparseCapacitySnapshot | DraftCapacitySnapshot
+    ),
 ) -> dict[str, dict[str, int | float]]:
     """Convert a capacity snapshot to used/available/total pool metrics."""
     if isinstance(snapshot, DeviceCapacitySnapshot):
@@ -875,6 +883,8 @@ def build_capacity_usage(
             ),
             "host": _pool_usage(snapshot.host_total, snapshot.host_available),
         }
+    if isinstance(snapshot, DraftCapacitySnapshot):
+        return {"draft": _pool_usage(snapshot.total, snapshot.available)}
     raise TypeError(f"unsupported capacity snapshot: {type(snapshot).__name__}")
 
 
@@ -938,6 +948,8 @@ def evaluate_hisparse_wave_admission(
     output_len: int,
     page_size: int,
     device_buffer_size: int,
+    speculative_reserve_per_request: int = 0,
+    draft_snapshot: Optional[DraftCapacitySnapshot] = None,
 ) -> HiSparseAdmissionDecision:
     """Check whether one more request per attention DP group can be prefetched.
 
@@ -953,6 +965,8 @@ def evaluate_hisparse_wave_admission(
         raise ValueError("input_len and output_len must be positive")
     if page_size <= 0 or device_buffer_size <= 0:
         raise ValueError("page_size and device_buffer_size must be positive")
+    if speculative_reserve_per_request < 0:
+        raise ValueError("speculative_reserve_per_request must be non-negative")
 
     full_len = input_len + output_len
     aligned_input_len = _align_up(input_len, page_size)
@@ -964,15 +978,25 @@ def evaluate_hisparse_wave_admission(
     hot_per_ready_request = min(aligned_full_len, device_buffer_size)
     if hot_per_ready_request == device_buffer_size:
         hot_per_ready_request += page_size
+    speculative_reserve_for_next_wave = (
+        ready_count + 1
+    ) * speculative_reserve_per_request
+    logical_for_next_wave = (
+        ready_count * (aligned_full_len - aligned_input_len)
+        + next_request_logical_peak
+        + speculative_reserve_for_next_wave
+    )
 
     requirements = HiSparseCapacityRequirements(
         hot_per_ready_request=hot_per_ready_request,
         hot_prefill_peak=input_len + page_size,
-        logical_for_next_wave=(
-            ready_count * (aligned_full_len - aligned_input_len)
-            + next_request_logical_peak
+        hot_decode_for_next_wave=(
+            (ready_count + 1) * hot_per_ready_request
+            + speculative_reserve_for_next_wave
         ),
+        logical_for_next_wave=logical_for_next_wave,
         host_for_next_wave=ready_count * output_len + full_len,
+        draft_for_next_wave=logical_for_next_wave,
     )
 
     def decision(can_admit: bool, reason: str) -> HiSparseAdmissionDecision:
@@ -990,12 +1014,17 @@ def evaluate_hisparse_wave_admission(
     # decode, so they do not consume hot slots during the next prefill wave.
     if snapshot.hot_available < requirements.hot_prefill_peak:
         return decision(False, "hot_prefill_peak")
-    if snapshot.hot_total < (ready_count + 1) * hot_per_ready_request:
+    if snapshot.hot_total < requirements.hot_decode_for_next_wave:
         return decision(False, "hot_decode_reserve")
     if snapshot.logical_available < requirements.logical_for_next_wave:
         return decision(False, "logical_pool")
     if snapshot.host_available < requirements.host_for_next_wave:
         return decision(False, "host_pool")
+    if (
+        draft_snapshot is not None
+        and draft_snapshot.available < requirements.draft_for_next_wave
+    ):
+        return decision(False, "draft_device_pool")
     return decision(True, "admitted")
 
 

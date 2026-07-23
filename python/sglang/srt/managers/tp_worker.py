@@ -234,6 +234,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        enable_hisparse_override: Optional[bool] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -251,6 +252,7 @@ class TpModelWorker(BaseTpWorker):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.memory_pool_config = memory_pool_config
+        self.enable_hisparse_override = enable_hisparse_override
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
 
@@ -359,6 +361,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            enable_hisparse_override=self.enable_hisparse_override,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -385,6 +388,7 @@ class TpModelWorker(BaseTpWorker):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
+                    enable_hisparse_override=self.enable_hisparse_override,
                 )
             )
 

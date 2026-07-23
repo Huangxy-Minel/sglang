@@ -413,7 +413,6 @@ class TestMTPHelpers(unittest.TestCase):
 
     def test_speculative_mode_rejects_unsupported_combinations(self):
         for kwargs, message in (
-            ({"enable_hisparse": True}, "HiSparse"),
             ({"correctness_test": True}, "correctness"),
             (
                 {"profile_enabled": True, "profile_execution_mode": "eager"},
@@ -434,6 +433,17 @@ class TestMTPHelpers(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaisesRegex(ValueError, message):
                     bench_utils.validate_one_batch_speculative_mode(**defaults)
+
+    def test_speculative_mode_accepts_hisparse_with_builtin_eagle(self):
+        bench_utils.validate_one_batch_speculative_mode(
+            spec_algorithm="EAGLE",
+            enable_hisparse=True,
+            correctness_test=False,
+            profile_enabled=False,
+            profile_execution_mode="runtime",
+            model_path="/target",
+            draft_model_path="/target",
+        )
 
     def test_exact_output_filter_uses_per_request_lengths(self):
         self.assertEqual(
@@ -851,6 +861,44 @@ class TestHiSparseWaveCapacity(unittest.TestCase):
         self.assertEqual(decision.requirements.logical_for_next_wave, 4352)
         self.assertEqual(decision.requirements.host_for_next_wave, 4352)
 
+    def test_dense_draft_capacity_reserves_committed_and_candidate_tokens(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(),
+            draft_snapshot=bench_utils.DraftCapacitySnapshot(
+                total=20000,
+                available=4479,
+            ),
+            ready_count=1,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            device_buffer_size=4096,
+            speculative_reserve_per_request=64,
+        )
+
+        self.assertFalse(decision.can_admit)
+        self.assertEqual(decision.stop_reason, "draft_device_pool")
+        self.assertEqual(decision.requirements.draft_for_next_wave, 4480)
+
+    def test_dense_draft_capacity_allows_exact_remaining_capacity(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(),
+            draft_snapshot=bench_utils.DraftCapacitySnapshot(
+                total=20000,
+                available=4480,
+            ),
+            ready_count=1,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            device_buffer_size=4096,
+            speculative_reserve_per_request=64,
+        )
+
+        self.assertTrue(decision.can_admit)
+
     def test_hot_prefill_peak_stops_before_launching_partial_wave(self):
         decision = bench_utils.evaluate_hisparse_wave_admission(
             snapshot=self._snapshot(hot_total=8256, hot_available=4096),
@@ -876,6 +924,23 @@ class TestHiSparseWaveCapacity(unittest.TestCase):
         )
         self.assertFalse(decision.can_admit)
         self.assertEqual(decision.stop_reason, "hot_decode_reserve")
+
+    def test_hisparse_mtp_reserves_target_candidate_slots(self):
+        decision = bench_utils.evaluate_hisparse_wave_admission(
+            snapshot=self._snapshot(hot_total=8447),
+            ready_count=1,
+            requested_batch_size=4,
+            input_len=4096,
+            output_len=128,
+            page_size=64,
+            device_buffer_size=4096,
+            speculative_reserve_per_request=64,
+        )
+
+        self.assertFalse(decision.can_admit)
+        self.assertEqual(decision.stop_reason, "hot_decode_reserve")
+        self.assertEqual(decision.requirements.hot_decode_for_next_wave, 8448)
+        self.assertEqual(decision.requirements.logical_for_next_wave, 4480)
 
     def test_deferred_hydration_reaches_decode_capacity_after_long_prefill(self):
         snapshot = self._snapshot(

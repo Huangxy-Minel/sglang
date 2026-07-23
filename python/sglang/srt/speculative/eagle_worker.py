@@ -1,5 +1,6 @@
 import logging
 import time
+from dataclasses import replace
 from typing import List, Optional, Tuple
 
 import torch
@@ -46,6 +47,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.srt.speculative.memory_config import resolve_draft_token_capacity
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
@@ -115,6 +117,19 @@ class EAGLEWorker(TpModelWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        target_memory_pool_config = target_worker.model_runner.memory_pool_config
+        target_logical_capacity = (
+            getattr(self.token_to_kv_pool_allocator, "size_full", None)
+            if server_args.enable_hisparse
+            else None
+        )
+        draft_memory_pool_config = replace(
+            target_memory_pool_config,
+            max_total_num_tokens=resolve_draft_token_capacity(
+                target_device_capacity=target_memory_pool_config.max_total_num_tokens,
+                target_logical_capacity=target_logical_capacity,
+            ),
+        )
 
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -152,7 +167,8 @@ class EAGLEWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
+                memory_pool_config=draft_memory_pool_config,
+                enable_hisparse_override=False,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()

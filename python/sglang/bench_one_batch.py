@@ -67,6 +67,7 @@ import torch.distributed as dist
 from sglang.bench_one_batch_utils import (
     ChunkPlan,
     DeviceCapacitySnapshot,
+    DraftCapacitySnapshot,
     HBMUsageSnapshot,
     HiSparseCapacitySnapshot,
     build_capacity_usage,
@@ -787,6 +788,23 @@ class _TorchBenchRunner:
         self.spec_algorithm = spec_algorithm
         self._active_batch = None
         self._owned_reqs = []
+        self._validate_mtp_hisparse_memory()
+
+    def _validate_mtp_hisparse_memory(self):
+        if not (self.is_mtp and self.is_hisparse):
+            return
+        draft_runner = self.generation_worker.draft_model_runner
+        if draft_runner.hisparse_coordinator is not None:
+            raise RuntimeError("MTP draft runner must not initialize HiSparse")
+        logical_capacity = (
+            self.torch_runner.token_to_kv_pool_allocator.logical_attn_allocator.size
+        )
+        if draft_runner.token_to_kv_pool.size < logical_capacity:
+            raise RuntimeError(
+                "MTP draft KV pool must cover the target logical capacity: "
+                f"draft={draft_runner.token_to_kv_pool.size}, "
+                f"logical={logical_capacity}"
+            )
 
     def clear(self):
         if self._owned_reqs:
@@ -901,7 +919,9 @@ class _TorchBenchRunner:
             logical_available=allocator.logical_attn_allocator.available_size(),
             host_total=coordinator.mem_pool_host.size,
             host_available=coordinator.mem_pool_host.available_size(),
-            request_slots_available=self.torch_runner.req_to_token_pool.available_size(),
+            request_slots_available=(
+                self.torch_runner.req_to_token_pool.available_size()
+            ),
             max_context_len=self.torch_runner.req_to_token_pool.max_context_len,
         )
 
@@ -914,6 +934,21 @@ class _TorchBenchRunner:
                 self.torch_runner.req_to_token_pool.available_size()
             ),
             max_context_len=self.torch_runner.req_to_token_pool.max_context_len,
+        )
+
+    def _draft_capacity_snapshot(self) -> DraftCapacitySnapshot:
+        draft_pool = self.generation_worker.draft_model_runner.token_to_kv_pool
+        allocator = self.torch_runner.token_to_kv_pool_allocator
+        if self.is_hisparse:
+            logical_allocator = allocator.logical_attn_allocator
+            committed_tokens = (
+                logical_allocator.size - logical_allocator.available_size()
+            )
+        else:
+            committed_tokens = allocator.size - allocator.available_size()
+        return DraftCapacitySnapshot(
+            total=draft_pool.size,
+            available=max(0, draft_pool.size - committed_tokens),
         )
 
     def _capacity_snapshot(self):
@@ -943,6 +978,8 @@ class _TorchBenchRunner:
         cluster_snapshot,
         admission,
         ready_count: int,
+        local_draft_snapshot=None,
+        cluster_draft_snapshot=None,
     ) -> Optional[int]:
         if admission.can_admit or admission.stop_reason == "target_reached":
             return None
@@ -972,6 +1009,11 @@ class _TorchBenchRunner:
             local_value, cluster_value = (
                 local_snapshot.host_available,
                 cluster_snapshot.host_available,
+            )
+        elif reason == "draft_device_pool":
+            local_value, cluster_value = (
+                local_draft_snapshot.available,
+                cluster_draft_snapshot.available,
             )
         elif reason == "request_pool":
             local_value, cluster_value = (
@@ -1084,6 +1126,7 @@ class _TorchBenchRunner:
                     "hot": "hot KV",
                     "logical": "logical KV",
                     "host": "host KV",
+                    "draft": "draft KV",
                 }[pool_name]
                 capacity_parts.append(
                     f"{label}: {pool['used']}/{pool['total']} slots "
@@ -1109,6 +1152,16 @@ class _TorchBenchRunner:
                 control_tic = time.perf_counter()
                 local_snapshot = self._capacity_snapshot()
                 cluster_snapshot = self._cluster_min_capacity_snapshot(local_snapshot)
+                local_draft_snapshot = (
+                    self._draft_capacity_snapshot()
+                    if self.is_hisparse and self.is_mtp
+                    else None
+                )
+                cluster_draft_snapshot = (
+                    self._cluster_min_capacity_snapshot(local_draft_snapshot)
+                    if local_draft_snapshot is not None
+                    else None
+                )
                 if self.is_hisparse:
                     admission = evaluate_hisparse_wave_admission(
                         snapshot=cluster_snapshot,
@@ -1118,6 +1171,10 @@ class _TorchBenchRunner:
                         output_len=output_len,
                         page_size=self.page_size,
                         device_buffer_size=coordinator.device_buffer_size,
+                        speculative_reserve_per_request=(
+                            self.speculative_reserve_per_request
+                        ),
+                        draft_snapshot=cluster_draft_snapshot,
                     )
                     requirements = dataclasses.asdict(admission.requirements)
                 else:
@@ -1138,6 +1195,8 @@ class _TorchBenchRunner:
                     cluster_snapshot,
                     admission,
                     len(ready_reqs),
+                    local_draft_snapshot=local_draft_snapshot,
+                    cluster_draft_snapshot=cluster_draft_snapshot,
                 )
                 control_latency += time.perf_counter() - control_tic
                 capacity_snapshots.append(
@@ -1145,6 +1204,15 @@ class _TorchBenchRunner:
                         "wave": len(ready_reqs),
                         "ready_count": len(ready_reqs),
                         **dataclasses.asdict(cluster_snapshot),
+                        **(
+                            {
+                                "draft": dataclasses.asdict(
+                                    cluster_draft_snapshot
+                                )
+                            }
+                            if cluster_draft_snapshot is not None
+                            else {}
+                        ),
                         "requirements": requirements,
                         "decision": admission.stop_reason,
                         "limiting_rank": limiting_rank,
@@ -1209,6 +1277,11 @@ class _TorchBenchRunner:
                     input_len=input_len,
                     elapsed=elapsed,
                 )
+                capacity_usage = build_capacity_usage(self._capacity_snapshot())
+                if self.is_hisparse and self.is_mtp:
+                    capacity_usage.update(
+                        build_capacity_usage(self._draft_capacity_snapshot())
+                    )
                 progress = {
                     "wave": wave_index + 1,
                     "batch_size": len(ready_reqs),
@@ -1216,7 +1289,7 @@ class _TorchBenchRunner:
                     "wave_latency_s": time.perf_counter() - wave_tic,
                     "elapsed_s": elapsed,
                     **wave_metrics,
-                    "capacity": build_capacity_usage(self._capacity_snapshot()),
+                    "capacity": capacity_usage,
                 }
                 progress_metrics.append(progress)
                 is_final = len(ready_reqs) >= requested_batch_size
