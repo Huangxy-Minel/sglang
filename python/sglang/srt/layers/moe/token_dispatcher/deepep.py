@@ -18,6 +18,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.token_dispatcher.deepep_compat import (
+    get_dispatch_config,
+)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -164,7 +167,11 @@ class DeepEPBuffer:
             hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
-                or Buffer.get_dispatch_config(group.size()),
+                or get_dispatch_config(
+                    Buffer,
+                    num_ranks=group.size(),
+                    real_hidden_bytes=hidden_bytes,
+                ),
                 DeepEPConfig.get_instance().normal_combine_config
                 or Buffer.get_combine_config(group.size()),
             ):
