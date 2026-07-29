@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep_compat import (
+    get_combine_config,
     get_dispatch_config,
     get_normal_buffer_size_hints,
     get_normal_dispatch_hidden_bytes,
@@ -191,7 +192,11 @@ class DeepEPBuffer:
             )
             combine_config = (
                 DeepEPConfig.get_instance().normal_combine_config
-                or Buffer.get_combine_config(group.size())
+                or get_combine_config(
+                    Buffer,
+                    num_ranks=group.size(),
+                    real_hidden_bytes=combine_hidden_bytes,
+                )
             )
             num_nvl_bytes, num_rdma_bytes = get_normal_buffer_size_hints(
                 dispatch_config=dispatch_config,

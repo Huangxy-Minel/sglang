@@ -27,11 +27,19 @@ class LegacyBuffer:
     def get_dispatch_config(num_ranks):
         return ("legacy", num_ranks)
 
+    @staticmethod
+    def get_combine_config(num_ranks):
+        return ("legacy-combine", num_ranks)
+
 
 class BlackwellBuffer:
     @staticmethod
     def get_dispatch_config(num_ranks, real_hidden_bytes=0):
         return ("blackwell", num_ranks, real_hidden_bytes)
+
+    @staticmethod
+    def get_combine_config(num_ranks, real_hidden_bytes=0):
+        return ("blackwell-combine", num_ranks, real_hidden_bytes)
 
 
 class DispatchHintConfig:
@@ -80,6 +88,28 @@ class TestDeepEPDispatchConfigCompatibility(unittest.TestCase):
         )
 
         self.assertEqual(config, ("legacy", 8))
+
+    def test_passes_real_hidden_bytes_to_blackwell_combine_config(self):
+        get_combine_config = self.require_helper("get_combine_config")
+
+        config = get_combine_config(
+            BlackwellBuffer,
+            num_ranks=8,
+            real_hidden_bytes=12288,
+        )
+
+        self.assertEqual(config, ("blackwell-combine", 8, 12288))
+
+    def test_keeps_legacy_combine_signature_compatible(self):
+        get_combine_config = self.require_helper("get_combine_config")
+
+        config = get_combine_config(
+            LegacyBuffer,
+            num_ranks=8,
+            real_hidden_bytes=12288,
+        )
+
+        self.assertEqual(config, ("legacy-combine", 8))
 
     def test_enables_fp8_for_deepgemm_normal_dispatch(self):
         use_fp8_normal_dispatch = self.require_helper("use_fp8_normal_dispatch")
