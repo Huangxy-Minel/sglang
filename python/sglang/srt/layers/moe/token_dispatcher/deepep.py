@@ -20,6 +20,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep_compat import (
     get_dispatch_config,
+    get_normal_buffer_size_hints,
+    get_normal_dispatch_hidden_bytes,
+    use_fp8_normal_dispatch,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
@@ -61,6 +64,14 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _use_fp8_normal_dispatch() -> bool:
+    return use_fp8_normal_dispatch(
+        enable_jit_deepgemm=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM,
+        is_cutlass=get_moe_runner_backend().is_cutlass(),
+        force_bf16_dispatch=envs.SGLANG_DEEPEP_BF16_DISPATCH.get(),
+    )
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -151,6 +162,7 @@ class DeepEPBuffer:
         group: dist.ProcessGroup,
         hidden_size: int,
         param_bytes: int,
+        use_fp8_dispatch: bool,
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
@@ -164,25 +176,30 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
-            hidden_bytes = hidden_size * param_bytes
-            for config in (
+            dispatch_hidden_bytes = get_normal_dispatch_hidden_bytes(
+                hidden_size,
+                use_fp8_dispatch=use_fp8_dispatch,
+            )
+            combine_hidden_bytes = hidden_size * param_bytes
+            dispatch_config = (
                 DeepEPConfig.get_instance().normal_dispatch_config
                 or get_dispatch_config(
                     Buffer,
                     num_ranks=group.size(),
-                    real_hidden_bytes=hidden_bytes,
-                ),
+                    real_hidden_bytes=dispatch_hidden_bytes,
+                )
+            )
+            combine_config = (
                 DeepEPConfig.get_instance().normal_combine_config
-                or Buffer.get_combine_config(group.size()),
-            ):
-                num_nvl_bytes = max(
-                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
-                    num_nvl_bytes,
-                )
-                num_rdma_bytes = max(
-                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
-                    num_rdma_bytes,
-                )
+                or Buffer.get_combine_config(group.size())
+            )
+            num_nvl_bytes, num_rdma_bytes = get_normal_buffer_size_hints(
+                dispatch_config=dispatch_config,
+                combine_config=combine_config,
+                dispatch_hidden_bytes=dispatch_hidden_bytes,
+                combine_hidden_bytes=combine_hidden_bytes,
+                num_ranks=group.size(),
+            )
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
@@ -401,11 +418,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and not get_moe_runner_backend().is_cutlass()
-            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-        ):
+        if _use_fp8_normal_dispatch():
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -539,12 +552,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
         return DeepEPBuffer.get_deepep_buffer(
-            self.group,
-            self.hidden_size,
-            self.params_bytes,
-            self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank,
-            self.num_experts,
+            group=self.group,
+            hidden_size=self.hidden_size,
+            param_bytes=self.params_bytes,
+            use_fp8_dispatch=_use_fp8_normal_dispatch(),
+            deepep_mode=self.deepep_mode,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_experts=self.num_experts,
         )
 
 
@@ -728,12 +742,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         return DeepEPBuffer.get_deepep_buffer(
-            self.group,
-            self.hidden_size,
-            self.params_bytes,
-            self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank,
-            self.num_experts,
+            group=self.group,
+            hidden_size=self.hidden_size,
+            param_bytes=self.params_bytes,
+            use_fp8_dispatch=_use_fp8_normal_dispatch(),
+            deepep_mode=self.deepep_mode,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_experts=self.num_experts,
         )
 
 
