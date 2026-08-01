@@ -148,6 +148,150 @@ class TestChunkPlan(unittest.TestCase):
         self.assertEqual(req.extend_input_len, 128)
 
 
+class TestPrefillProfilePlan(unittest.TestCase):
+    def test_profile_window_skips_16_waves_then_profiles_one(self):
+        plan = bench_utils.build_prefill_profile_plan(
+            requested_batch_size=32,
+            profile_enabled=True,
+            profile_stage="prefill",
+            profile_start_wave=16,
+            profile_waves=1,
+            exit_after_capture=True,
+        )
+
+        self.assertFalse(plan.action_for_wave(15).profile)
+        self.assertTrue(plan.action_for_wave(16).start)
+        self.assertTrue(plan.action_for_wave(16).profile)
+        self.assertTrue(plan.action_for_wave(16).stop_after_wave)
+        self.assertTrue(plan.action_for_wave(16).exit_after_wave)
+        self.assertFalse(plan.action_for_wave(17).profile)
+        self.assertEqual(plan.profiled_waves, 1)
+
+    def test_unspecified_window_profiles_all_prefill_waves(self):
+        plan = bench_utils.build_prefill_profile_plan(
+            requested_batch_size=32,
+            profile_enabled=True,
+            profile_stage="prefill",
+            profile_start_wave=None,
+            profile_waves=None,
+            exit_after_capture=True,
+        )
+
+        self.assertFalse(plan.windowed)
+        self.assertTrue(plan.action_for_wave(0).start)
+        self.assertTrue(plan.action_for_wave(31).profile)
+        self.assertFalse(plan.action_for_wave(31).stop_after_wave)
+        self.assertTrue(plan.exit_after_capture)
+        self.assertEqual(plan.trace_batch_size(executed_waves=12), 12)
+
+    def test_partial_window_arguments_use_decode_style_defaults(self):
+        start_only = bench_utils.build_prefill_profile_plan(
+            requested_batch_size=32,
+            profile_enabled=True,
+            profile_stage="prefill",
+            profile_start_wave=16,
+            profile_waves=None,
+            exit_after_capture=False,
+        )
+        waves_only = bench_utils.build_prefill_profile_plan(
+            requested_batch_size=32,
+            profile_enabled=True,
+            profile_stage="prefill",
+            profile_start_wave=None,
+            profile_waves=2,
+            exit_after_capture=False,
+        )
+
+        self.assertEqual((start_only.start_wave, start_only.end_wave), (16, 17))
+        self.assertEqual((waves_only.start_wave, waves_only.end_wave), (0, 2))
+
+    def test_prefill_window_rejects_invalid_bounds(self):
+        cases = [
+            ({"profile_start_wave": -1, "profile_waves": 1}, "non-negative"),
+            ({"profile_start_wave": 0, "profile_waves": 0}, "positive"),
+            ({"profile_start_wave": 31, "profile_waves": 2}, "requested batch"),
+        ]
+        for window, message in cases:
+            with self.subTest(window=window):
+                with self.assertRaisesRegex(ValueError, message):
+                    bench_utils.build_prefill_profile_plan(
+                        requested_batch_size=32,
+                        profile_enabled=True,
+                        profile_stage="prefill",
+                        exit_after_capture=False,
+                        **window,
+                    )
+
+    def test_prefill_window_controls_require_prefill_profiling(self):
+        with self.assertRaisesRegex(ValueError, "require --profile"):
+            bench_utils.build_prefill_profile_plan(
+                requested_batch_size=32,
+                profile_enabled=False,
+                profile_stage="prefill",
+                profile_start_wave=16,
+                profile_waves=1,
+                exit_after_capture=False,
+            )
+        with self.assertRaisesRegex(ValueError, "prefill profile stage"):
+            bench_utils.build_prefill_profile_plan(
+                requested_batch_size=32,
+                profile_enabled=True,
+                profile_stage="decode",
+                profile_start_wave=16,
+                profile_waves=1,
+                exit_after_capture=False,
+            )
+
+    def test_all_stage_leaves_early_exit_to_decode(self):
+        plan = bench_utils.build_prefill_profile_plan(
+            requested_batch_size=32,
+            profile_enabled=True,
+            profile_stage="all",
+            profile_start_wave=16,
+            profile_waves=1,
+            exit_after_capture=True,
+        )
+
+        self.assertFalse(plan.action_for_wave(16).exit_after_wave)
+        self.assertFalse(plan.exit_after_capture)
+
+    def test_incomplete_explicit_window_reports_admission_stop(self):
+        plan = bench_utils.build_prefill_profile_plan(
+            requested_batch_size=32,
+            profile_enabled=True,
+            profile_stage="prefill",
+            profile_start_wave=16,
+            profile_waves=2,
+            exit_after_capture=False,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"window=\[16, 18\).*executed_waves=17.*stop_reason=host_pool",
+        ):
+            bench_utils.validate_prefill_profile_completion(
+                plan,
+                executed_waves=17,
+                stop_reason="host_pool",
+            )
+
+    def test_windowed_prefill_trace_stage_includes_half_open_bounds(self):
+        plan = bench_utils.build_prefill_profile_plan(
+            requested_batch_size=32,
+            profile_enabled=True,
+            profile_stage="prefill",
+            profile_start_wave=16,
+            profile_waves=1,
+            exit_after_capture=False,
+        )
+
+        self.assertEqual(
+            bench_utils.prefill_profile_stage_name(plan),
+            "prefill_wave16_17",
+        )
+        self.assertEqual(plan.trace_batch_size(executed_waves=32), 17)
+
+
 class TestDecodeProfilePlan(unittest.TestCase):
     def test_gpu_profile_also_captures_cpu_ranges(self):
         self.assertEqual(
@@ -261,7 +405,7 @@ class TestDecodeProfilePlan(unittest.TestCase):
                 profile_start_step=16,
                 profile_steps=8,
                 execution_mode="eager",
-                exit_after_capture=True,
+                exit_after_capture=False,
             )
 
 

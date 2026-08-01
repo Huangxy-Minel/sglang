@@ -69,12 +69,14 @@ from sglang.bench_one_batch_utils import (
     DeviceCapacitySnapshot,
     HBMUsageSnapshot,
     HiSparseCapacitySnapshot,
+    PrefillProfilePlan,
     build_capacity_usage,
     build_chunk_plan,
     build_cluster_metrics,
     build_decode_profile_plan,
     build_decode_step_metrics,
     build_deepep_micro_warmup_shape,
+    build_prefill_profile_plan,
     build_profile_trace_filename,
     build_prefill_wave_metrics,
     build_wave_chunk_plan,
@@ -82,6 +84,7 @@ from sglang.bench_one_batch_utils import (
     evaluate_hisparse_wave_admission,
     get_local_rank_assignments,
     normalize_profile_activities,
+    prefill_profile_stage_name,
     prepare_chunk_requests,
     resolve_target_warmup_log_interval,
     resolve_one_batch_cuda_graph_max_bs,
@@ -90,6 +93,7 @@ from sglang.bench_one_batch_utils import (
     split_kv_pool_bytes,
     summarize_hbm_usage,
     unique_cuda_storage_bytes,
+    validate_prefill_profile_completion,
     values_from_slowest_rank,
 )
 from sglang.srt.configs.model_config import ModelConfig
@@ -192,15 +196,31 @@ def stop_profile(
         profiler.stop()
 
     if save_trace:
-        if profiler is not None:
-            if trace_filename:
-                _save_profile_trace_results(profiler, trace_filename)
-                stage_desc = f"for {stage}" if stage else ""
-                rank_print(
-                    f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
-                )
-        if "CUDA_PROFILER" in profile_activities:
-            rank_print(f"CUDA profiler trace for {stage} completed")
+        save_profile_trace(
+            profiler,
+            profile_activities,
+            rank_print=rank_print,
+            trace_filename=trace_filename,
+            stage=stage,
+        )
+
+
+def save_profile_trace(
+    profiler,
+    profile_activities,
+    rank_print=print,
+    trace_filename=None,
+    stage=None,
+):
+    """Save results from a profiler that has already been stopped."""
+    if profiler is not None and trace_filename:
+        _save_profile_trace_results(profiler, trace_filename)
+        stage_desc = f"for {stage}" if stage else ""
+        rank_print(
+            f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
+        )
+    if "CUDA_PROFILER" in profile_activities:
+        rank_print(f"CUDA profiler trace for {stage} completed")
 
 
 @contextmanager
@@ -244,6 +264,8 @@ class BenchArgs:
     profile_output_dir: Optional[str] = None
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
+    profile_start_wave: Optional[int] = None
+    profile_waves: Optional[int] = None
     profile_execution_mode: str = "runtime"
     profile_exit_after_capture: bool = False
     # This option is registered by ServerArgs. Keeping the raw CLI value here
@@ -358,6 +380,24 @@ class BenchArgs:
             help="Number of decode steps to profile starting from profile-start-step. If not specified, profiles only one step.",
         )
         parser.add_argument(
+            "--profile-start-wave",
+            type=int,
+            default=None,
+            help=(
+                "Prefill wave at which to start profiling (0-indexed). "
+                "If omitted together with --profile-waves, profiles all waves."
+            ),
+        )
+        parser.add_argument(
+            "--profile-waves",
+            type=int,
+            default=None,
+            help=(
+                "Number of prefill waves to profile. If specified without "
+                "--profile-start-wave, starts at wave 0."
+            ),
+        )
+        parser.add_argument(
             "--profile-execution-mode",
             choices=["runtime", "eager"],
             default=BenchArgs.profile_execution_mode,
@@ -370,7 +410,7 @@ class BenchArgs:
         parser.add_argument(
             "--profile-exit-after-capture",
             action="store_true",
-            help="Exit the benchmark after the decode profile window is saved.",
+            help="Exit the benchmark after the selected profile window is saved.",
         )
 
     @classmethod
@@ -840,8 +880,10 @@ class _TorchBenchRunner:
         dp_size,
         log_prefill_wave,
         rank_print,
-        trace_enabled,
-        phase_label,
+        prefill_profile_plan: PrefillProfilePlan,
+        profile_start_callback=None,
+        profile_stop_callback=None,
+        phase_label="Benchmark",
     ):
         chunk_plan = build_wave_chunk_plan(
             input_len=input_len,
@@ -860,6 +902,8 @@ class _TorchBenchRunner:
         stop_reason = "target_reached"
         progress_metrics = []
         last_logged_ready_count = 0
+        profile_capture_completed = False
+        profile_early_exit = False
         prefill_tic = time.perf_counter()
 
         def emit_progress(progress, final_reason=None):
@@ -940,44 +984,59 @@ class _TorchBenchRunner:
 
                 req = reqs[len(ready_reqs)]
                 wave_index = len(ready_reqs)
-                wave_tic = time.perf_counter()
-                self.synchronize()
-                compute_tic = time.perf_counter()
-                next_token_ids, _, _ = self.prefill(
-                    [req],
-                    chunk_plan=chunk_plan,
-                    trace_enabled=trace_enabled,
-                    trace_prefix=f"prefill/wave_{wave_index}",
+                profile_action = prefill_profile_plan.action_for_wave(wave_index)
+                if profile_action.start and profile_start_callback is not None:
+                    profile_start_callback()
+                trace_wave = (
+                    profile_start_callback is not None
+                    and profile_action.profile
                 )
-                self.synchronize()
-                prefill_compute_latency += time.perf_counter() - compute_tic
-                req.output_ids.append(int(next_token_ids[0].item()))
-
-                if self.is_hisparse:
-                    # Stage once after all chunks of this request have completed.
+                wave_tic = time.perf_counter()
+                with trace_range(
+                    f"prefill/wave_{wave_index}/end_to_end", trace_wave
+                ):
                     self.synchronize()
-                    staging_tic = time.perf_counter()
-                    with trace_range(
-                        f"hisparse/staging/wave_{wave_index}", trace_enabled
-                    ):
-                        coordinator.admit_request_into_staging(req)
-                        coordinator.write_staging_stream.synchronize()
-                        wave_ready_reqs = coordinator.collect_host_ready_reqs()
-                        self.synchronize()
-                    staging_latency += time.perf_counter() - staging_tic
-                    if len(wave_ready_reqs) != 1 or wave_ready_reqs[0] is not req:
-                        raise RuntimeError(
-                            "HiSparse one-batch expected exactly one ready request per "
-                            "wave, got "
-                            f"{[ready_req.rid for ready_req in wave_ready_reqs]}"
-                        )
-                else:
-                    wave_ready_reqs = [req]
-                ready_reqs.extend(wave_ready_reqs)
+                    compute_tic = time.perf_counter()
+                    next_token_ids, _, _ = self.prefill(
+                        [req],
+                        chunk_plan=chunk_plan,
+                        trace_enabled=trace_wave,
+                        trace_prefix=f"prefill/wave_{wave_index}",
+                    )
+                    self.synchronize()
+                    prefill_compute_latency += time.perf_counter() - compute_tic
+                    req.output_ids.append(int(next_token_ids[0].item()))
 
-                control_tic = time.perf_counter()
-                self.barrier()
-                control_latency += time.perf_counter() - control_tic
+                    if self.is_hisparse:
+                        # Stage once after all chunks of this request have completed.
+                        self.synchronize()
+                        staging_tic = time.perf_counter()
+                        with trace_range(
+                            f"hisparse/staging/wave_{wave_index}", trace_wave
+                        ):
+                            coordinator.admit_request_into_staging(req)
+                            coordinator.write_staging_stream.synchronize()
+                            wave_ready_reqs = coordinator.collect_host_ready_reqs()
+                            self.synchronize()
+                        staging_latency += time.perf_counter() - staging_tic
+                        if len(wave_ready_reqs) != 1 or wave_ready_reqs[0] is not req:
+                            raise RuntimeError(
+                                "HiSparse one-batch expected exactly one ready request per "
+                                "wave, got "
+                                f"{[ready_req.rid for ready_req in wave_ready_reqs]}"
+                            )
+                    else:
+                        wave_ready_reqs = [req]
+                    ready_reqs.extend(wave_ready_reqs)
+
+                    control_tic = time.perf_counter()
+                    self.barrier()
+                    control_latency += time.perf_counter() - control_tic
+
+                if profile_action.stop_after_wave:
+                    if profile_stop_callback is not None:
+                        profile_stop_callback()
+                    profile_capture_completed = True
 
                 elapsed = time.perf_counter() - prefill_tic
                 wave_metrics = build_prefill_wave_metrics(
@@ -1005,6 +1064,15 @@ class _TorchBenchRunner:
                         final_reason="target_reached" if is_final else None,
                     )
 
+                if profile_action.exit_after_wave:
+                    stop_reason = "profile_capture_complete"
+                    profile_early_exit = True
+                    break
+
+            if prefill_profile_plan.windowed and not profile_capture_completed:
+                if profile_stop_callback is not None:
+                    profile_stop_callback()
+
             if (
                 progress_metrics
                 and log_prefill_wave > 0
@@ -1020,7 +1088,12 @@ class _TorchBenchRunner:
 
             if self.is_hisparse:
                 control_tic = time.perf_counter()
-                with trace_range("hisparse/hydrate_decode_batch", trace_enabled):
+                trace_hydration = (
+                    profile_start_callback is not None
+                    and prefill_profile_plan.enabled
+                    and not prefill_profile_plan.windowed
+                )
+                with trace_range("hisparse/hydrate_decode_batch", trace_hydration):
                     for req in ready_reqs:
                         coordinator.admit_request_direct(req)
                     self.synchronize()
@@ -1029,6 +1102,8 @@ class _TorchBenchRunner:
             batch = self._build_decode_batch(ready_reqs)
             self._active_batch = batch
         except Exception:
+            if profile_stop_callback is not None:
+                profile_stop_callback()
             for req in reqs:
                 self._release_request(req)
             self._active_batch = None
@@ -1038,6 +1113,11 @@ class _TorchBenchRunner:
             "batch_size": len(ready_reqs),
             "num_waves": len(ready_reqs),
             "stop_reason": stop_reason,
+            "profile_capture_completed": (
+                profile_capture_completed
+                or (prefill_profile_plan.enabled and not prefill_profile_plan.windowed)
+            ),
+            "profile_early_exit": profile_early_exit,
             "prefill_compute_latency": prefill_compute_latency,
             "staging_latency": staging_latency,
             "prefill_control_latency": control_latency,
@@ -1517,6 +1597,8 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
+    profile_start_wave=None,
+    profile_waves=None,
     profile_execution_mode="runtime",
     profile_exit_after_capture=False,
     requested_chunked_prefill_size=None,
@@ -1537,6 +1619,14 @@ def latency_test_run_once(
         effective_chunk_size=server_args.chunked_prefill_size,
         page_size=model_runner.page_size,
     )
+    prefill_profile_plan = build_prefill_profile_plan(
+        requested_batch_size=requested_batch_size,
+        profile_enabled=bool(profile),
+        profile_stage=profile_stage,
+        profile_start_wave=profile_start_wave,
+        profile_waves=profile_waves,
+        exit_after_capture=profile_exit_after_capture,
+    )
     decode_profile_plan = build_decode_profile_plan(
         output_len=output_len,
         profile_enabled=bool(profile),
@@ -1544,7 +1634,9 @@ def latency_test_run_once(
         profile_start_step=profile_start_step,
         profile_steps=profile_steps,
         execution_mode=profile_execution_mode,
-        exit_after_capture=profile_exit_after_capture,
+        exit_after_capture=(
+            profile_exit_after_capture and profile_stage in ("all", "decode")
+        ),
     )
     profile_owner = bool(profile) and tp_rank == 0
 
@@ -1583,20 +1675,51 @@ def latency_test_run_once(
         f"per_request={chunk_plan.per_request_chunk_size}, "
         f"chunks={chunk_plan.num_chunks}"
     )
+    if prefill_profile_plan.enabled:
+        prefill_window = (
+            f"[{prefill_profile_plan.start_wave}, "
+            f"{prefill_profile_plan.end_wave})"
+            if prefill_profile_plan.windowed
+            else "all admitted waves"
+        )
+        rank_print(
+            "Prefill profile. "
+            f"waves={prefill_window}, "
+            f"exit_after_capture={prefill_profile_plan.exit_after_capture}"
+        )
 
     tot_latency = 0
 
     # No rank may start prefill before every rank has finished setup.
     model_runner.barrier()
-    profiler = None
-    enable_profile_prefill = profile_owner and profile_stage in ["all", "prefill"]
-    if enable_profile_prefill:
-        profiler = start_profile(
+    prefill_profiler = None
+    prefill_profile_started = False
+    prefill_profile_stopped = False
+
+    def start_prefill_profile():
+        nonlocal prefill_profiler, prefill_profile_started
+        if prefill_profile_started:
+            raise RuntimeError("prefill profiler cannot be started more than once")
+        prefill_profiler = start_profile(
             profile_activities,
             profile_record_shapes=profile_record_shapes,
             profile_with_stack=profile_with_stack,
             rank_print=rank_print,
         )
+        prefill_profile_started = True
+
+    def stop_prefill_profile():
+        nonlocal prefill_profile_stopped
+        if not prefill_profile_started or prefill_profile_stopped:
+            return
+        stop_profile(
+            prefill_profiler,
+            profile_activities,
+            rank_print=rank_print,
+            save_trace=False,
+            stage="prefill",
+        )
+        prefill_profile_stopped = True
 
     model_runner.synchronize()
     tic = time.perf_counter()
@@ -1610,8 +1733,25 @@ def latency_test_run_once(
         dp_size=server_args.dp_size,
         log_prefill_wave=log_prefill_wave,
         rank_print=rank_print,
-        trace_enabled=enable_profile_prefill,
+        prefill_profile_plan=prefill_profile_plan,
+        profile_start_callback=(
+            start_prefill_profile
+            if profile_owner and prefill_profile_plan.enabled
+            else None
+        ),
+        profile_stop_callback=(
+            stop_prefill_profile
+            if profile_owner and prefill_profile_plan.enabled
+            else None
+        ),
         phase_label=phase_label,
+    )
+    if profile_owner and prefill_profile_started and not prefill_profile_stopped:
+        stop_prefill_profile()
+    validate_prefill_profile_completion(
+        prefill_profile_plan,
+        executed_waves=wave_prefill["num_waves"],
+        stop_reason=wave_prefill["stop_reason"],
     )
     batch_size = wave_prefill["batch_size"]
     measurement_results.update(
@@ -1630,23 +1770,54 @@ def latency_test_run_once(
     model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
 
-    if enable_profile_prefill:
+    prefill_capture_completed = wave_prefill["profile_capture_completed"]
+    if profile_owner and prefill_capture_completed:
+        prefill_stage_name = prefill_profile_stage_name(prefill_profile_plan)
+        prefill_trace_batch_size = prefill_profile_plan.trace_batch_size(
+            executed_waves=wave_prefill["num_waves"]
+        )
         trace_filename = _create_torch_profiler_filename(
             profile_output_dir,
             profile_filename_prefix,
-            batch_size,
+            prefill_trace_batch_size,
             input_len,
             output_len,
-            "prefill",
+            prefill_stage_name,
             server_args,
         )
-        stop_profile(
-            profiler,
+        save_profile_trace(
+            prefill_profiler,
             profile_activities,
             rank_print=rank_print,
-            save_trace=True,
             trace_filename=trace_filename,
-            stage="prefill",
+            stage=prefill_stage_name,
+        )
+
+    prefill_profile_early_exit = bool(
+        prefill_capture_completed
+        and prefill_profile_plan.exit_after_capture
+        and (
+            wave_prefill["profile_early_exit"]
+            or not prefill_profile_plan.windowed
+        )
+    )
+    if prefill_profile_plan.enabled:
+        measurement_results.update(
+            {
+                "profiled_prefill_waves": (
+                    prefill_profile_plan.profiled_waves
+                    if prefill_profile_plan.windowed
+                    else wave_prefill["num_waves"]
+                ),
+                "profile_start_wave": prefill_profile_plan.start_wave,
+                "profile_end_wave": (
+                    prefill_profile_plan.end_wave
+                    if prefill_profile_plan.windowed
+                    else wave_prefill["num_waves"]
+                ),
+                "executed_prefill_waves": wave_prefill["num_waves"],
+                "profile_early_exit": prefill_profile_early_exit,
+            }
         )
 
     # Stop the profiler before cross-rank synchronization so barriers and
@@ -1700,6 +1871,22 @@ def latency_test_run_once(
 
     # This second gate makes decode start a distinct cluster-wide phase.
     model_runner.barrier()
+
+    if prefill_profile_early_exit:
+        measurement_results["executed_decode_steps"] = 0
+        skipped_work = (
+            "remaining prefill waves and decode"
+            if prefill_profile_plan.windowed
+            else "decode"
+        )
+        rank_print(
+            "Prefill profile capture complete. "
+            f"executed waves={wave_prefill['num_waves']}, "
+            f"profiled waves={measurement_results['profiled_prefill_waves']}; "
+            f"skipping {skipped_work}."
+        )
+        model_runner.cleanup(batch)
+        return measurement_results
 
     decode_process_latencies = []
     core_forward_tpots = []
@@ -2068,6 +2255,8 @@ def latency_test(
                 tp_rank=tp_rank,
                 profile_start_step=None,
                 profile_steps=None,
+                profile_start_wave=None,
+                profile_waves=None,
                 profile_execution_mode="runtime",
                 profile_exit_after_capture=False,
                 requested_chunked_prefill_size=bench_args.chunked_prefill_size,
@@ -2135,11 +2324,13 @@ def latency_test(
                 bench_args.profile_filename_prefix,
                 bench_args.profile_stage,
                 tp_rank,
-                bench_args.profile_start_step,
-                bench_args.profile_steps,
-                bench_args.profile_execution_mode,
-                bench_args.profile_exit_after_capture,
-                bench_args.chunked_prefill_size,
+                profile_start_step=bench_args.profile_start_step,
+                profile_steps=bench_args.profile_steps,
+                profile_start_wave=bench_args.profile_start_wave,
+                profile_waves=bench_args.profile_waves,
+                profile_execution_mode=bench_args.profile_execution_mode,
+                profile_exit_after_capture=bench_args.profile_exit_after_capture,
+                requested_chunked_prefill_size=bench_args.chunked_prefill_size,
                 report_hbm_usage=True,
                 phase_label="Benchmark",
             )

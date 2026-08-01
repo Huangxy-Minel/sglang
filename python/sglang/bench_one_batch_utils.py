@@ -22,6 +22,55 @@ class ChunkPlan:
 
 
 @dataclass(frozen=True)
+class PrefillProfileWaveAction:
+    start: bool
+    profile: bool
+    stop_after_wave: bool
+    exit_after_wave: bool
+
+
+@dataclass(frozen=True)
+class PrefillProfilePlan:
+    enabled: bool
+    start_wave: int
+    end_wave: Optional[int]
+    exit_after_capture: bool
+
+    @property
+    def profiled_waves(self) -> Optional[int]:
+        if not self.enabled or self.end_wave is None:
+            return None
+        return self.end_wave - self.start_wave
+
+    @property
+    def windowed(self) -> bool:
+        return self.enabled and self.end_wave is not None
+
+    def trace_batch_size(self, executed_waves: int) -> int:
+        """Return the admitted batch at the instant prefill capture ended."""
+        if self.windowed:
+            assert self.end_wave is not None
+            return self.end_wave
+        return executed_waves
+
+    def action_for_wave(self, wave: int) -> PrefillProfileWaveAction:
+        in_window = self.enabled and wave >= self.start_wave and (
+            self.end_wave is None or wave < self.end_wave
+        )
+        is_last_wave = (
+            in_window
+            and self.end_wave is not None
+            and wave == self.end_wave - 1
+        )
+        return PrefillProfileWaveAction(
+            start=in_window and wave == self.start_wave,
+            profile=in_window,
+            stop_after_wave=is_last_wave,
+            exit_after_wave=is_last_wave and self.exit_after_capture,
+        )
+
+
+@dataclass(frozen=True)
 class DecodeProfileStepAction:
     profile: bool
     force_eager: bool
@@ -147,6 +196,85 @@ def build_profile_trace_filename(
         f"input{input_len}_output{output_len}_{stage}.trace.json.gz"
     )
     return str(Path(output_dir) / filename)
+
+
+def build_prefill_profile_plan(
+    requested_batch_size: int,
+    profile_enabled: bool,
+    profile_stage: str,
+    profile_start_wave: Optional[int],
+    profile_waves: Optional[int],
+    exit_after_capture: bool,
+) -> PrefillProfilePlan:
+    """Validate and describe the prefill profiler capture window."""
+    has_window_control = profile_start_wave is not None or profile_waves is not None
+    has_prefill_exit_control = exit_after_capture and profile_stage == "prefill"
+    if (has_window_control or has_prefill_exit_control) and not profile_enabled:
+        raise ValueError(
+            "prefill profile window and --profile-exit-after-capture require --profile"
+        )
+    if has_window_control and profile_stage not in ("all", "prefill"):
+        raise ValueError(
+            "prefill profile window controls require a prefill profile stage"
+        )
+
+    prefill_enabled = profile_enabled and profile_stage in ("all", "prefill")
+    if not prefill_enabled:
+        return PrefillProfilePlan(
+            enabled=False,
+            start_wave=0,
+            end_wave=0,
+            exit_after_capture=False,
+        )
+
+    if requested_batch_size <= 0:
+        raise ValueError(
+            f"requested_batch_size must be positive, got {requested_batch_size}"
+        )
+
+    windowed = has_window_control
+    start_wave = profile_start_wave if profile_start_wave is not None else 0
+    waves = profile_waves if profile_waves is not None else 1
+    if start_wave < 0:
+        raise ValueError(
+            f"profile_start_wave must be non-negative, got {start_wave}"
+        )
+    if waves <= 0:
+        raise ValueError(f"profile_waves must be positive, got {waves}")
+    end_wave = start_wave + waves if windowed else None
+    if end_wave is not None and end_wave > requested_batch_size:
+        raise ValueError(
+            "prefill profile window exceeds requested batch: "
+            f"start={start_wave}, waves={waves}, "
+            f"requested_batch_size={requested_batch_size}"
+        )
+    return PrefillProfilePlan(
+        enabled=True,
+        start_wave=start_wave,
+        end_wave=end_wave,
+        exit_after_capture=exit_after_capture and profile_stage == "prefill",
+    )
+
+
+def prefill_profile_stage_name(plan: PrefillProfilePlan) -> str:
+    """Name a prefill trace, including explicit half-open wave bounds."""
+    if plan.windowed:
+        return f"prefill_wave{plan.start_wave}_{plan.end_wave}"
+    return "prefill"
+
+
+def validate_prefill_profile_completion(
+    plan: PrefillProfilePlan,
+    executed_waves: int,
+    stop_reason: str,
+) -> None:
+    """Reject an explicit prefill window that admission could not complete."""
+    if plan.windowed and executed_waves < plan.end_wave:
+        raise RuntimeError(
+            "prefill profile window was not completed: "
+            f"window=[{plan.start_wave}, {plan.end_wave}), "
+            f"executed_waves={executed_waves}, stop_reason={stop_reason}"
+        )
 
 
 def build_decode_profile_plan(
