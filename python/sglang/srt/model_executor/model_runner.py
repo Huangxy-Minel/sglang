@@ -1710,6 +1710,8 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        *,
+        force_eager: bool = False,
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -1755,6 +1757,7 @@ class ModelRunner:
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+                force_eager=force_eager,
             )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
@@ -1763,6 +1766,7 @@ class ModelRunner:
                     pp_proxy_tensors,
                     reinit_attn_backend,
                     split_forward_count,
+                    force_eager=force_eager,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
@@ -1859,6 +1863,8 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        *,
+        force_eager: bool = False,
     ) -> ModelRunnerOutput:
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
@@ -1871,7 +1877,8 @@ class ModelRunner:
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                not force_eager
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -1916,7 +1923,8 @@ class ModelRunner:
                     forward_count=split_forward_count,
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                not force_eager
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
@@ -2398,6 +2406,8 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool,
         split_forward_count: int,
+        *,
+        force_eager: bool = False,
     ) -> ModelRunnerOutput:
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
@@ -2405,6 +2415,7 @@ class ModelRunner:
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+                force_eager=force_eager,
             )
         return output
 

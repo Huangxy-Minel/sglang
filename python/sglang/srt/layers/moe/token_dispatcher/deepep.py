@@ -4,6 +4,7 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
@@ -19,6 +20,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatcherBaseHooks,
     DispatchOutput,
     DispatchOutputFormat,
+)
+from sglang.srt.layers.moe.token_dispatcher.deepep_compat import (
+    get_combine_config,
+    get_dispatch_config,
+    get_normal_buffer_size_hints,
+    get_normal_dispatch_hidden_bytes,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
@@ -192,6 +199,8 @@ class DeepEPBuffer:
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
+                num_nvl_bytes=0,
+                num_rdma_bytes=0,
             )
             buffers["deepep_ep_state"] = state
         return state
@@ -205,6 +214,7 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        dispatch_hidden_bytes: Optional[int] = None,
     ):
         state = cls._state()
         if state.buffer is not None:
@@ -216,21 +226,28 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
-            hidden_bytes = hidden_size * param_bytes
-            for config in (
+            if dispatch_hidden_bytes is None:
+                dispatch_hidden_bytes = hidden_size * param_bytes
+            combine_hidden_bytes = hidden_size * param_bytes
+            dispatch_config = (
                 DeepEPConfig.get_instance().normal_dispatch_config
-                or Buffer.get_dispatch_config(group.size()),
+                or get_dispatch_config(
+                    Buffer, group.size(), real_hidden_bytes=dispatch_hidden_bytes
+                )
+            )
+            combine_config = (
                 DeepEPConfig.get_instance().normal_combine_config
-                or Buffer.get_combine_config(group.size()),
-            ):
-                num_nvl_bytes = max(
-                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
-                    num_nvl_bytes,
+                or get_combine_config(
+                    Buffer, group.size(), real_hidden_bytes=combine_hidden_bytes
                 )
-                num_rdma_bytes = max(
-                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
-                    num_rdma_bytes,
-                )
+            )
+            num_nvl_bytes, num_rdma_bytes = get_normal_buffer_size_hints(
+                dispatch_config,
+                combine_config,
+                dispatch_hidden_bytes,
+                combine_hidden_bytes,
+                group.size(),
+            )
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
@@ -298,7 +315,14 @@ class DeepEPBuffer:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        state.num_nvl_bytes = num_nvl_bytes
+        state.num_rdma_bytes = num_rdma_bytes
         return state.buffer
+
+    @classmethod
+    def configured_buffer_bytes(cls) -> int:
+        state = cls._state()
+        return state.num_nvl_bytes + state.num_rdma_bytes
 
     @classmethod
     def clean_buffer(cls):
@@ -429,6 +453,21 @@ class _DeepEPDispatcherImplBase:
 
     def _get_buffer(self):
         raise NotImplementedError
+
+    def _normal_dispatch_hidden_bytes(self) -> int:
+        # AUTO may allocate the shared buffer from the low-latency implementation
+        # first. Resolve the normal override independently of the LL wire dtype.
+        normal_dispatcher = copy(self)
+        normal_dispatcher.dispatch_mode = DeepEPMode.NORMAL
+        dtype = get_deepep_output_dtype(normal_dispatcher)
+        # GPU INT8 requests are adjusted to FP8 by _validate_and_adjust_dtype.
+        use_fp8 = dtype == DispatcherOutputDtype.FP8 or (
+            not _is_npu and dtype == DispatcherOutputDtype.INT8
+        )
+        return get_normal_dispatch_hidden_bytes(
+            self.hidden_size,
+            use_fp8_dispatch=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and use_fp8,
+        )
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
@@ -729,6 +768,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            dispatch_hidden_bytes=self._normal_dispatch_hidden_bytes(),
         )
 
 
@@ -958,6 +998,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            dispatch_hidden_bytes=self._normal_dispatch_hidden_bytes(),
         )
 
 

@@ -624,7 +624,7 @@ class HiSparseCoordinator:
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
-    def collect_ready_reqs(self) -> List[Req]:
+    def _pop_finished_staging_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
@@ -645,12 +645,35 @@ class HiSparseCoordinator:
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
-            # prepare device buffer and update req
+            finish_count -= 1
+            ready_reqs.append(req)
+        return ready_reqs
+
+    def collect_ready_reqs(self) -> List[Req]:
+        ready_reqs = self._pop_finished_staging_reqs()
+        for req in ready_reqs:
+            # Ordinary serving reuses prefill KV as the initial decode buffer.
             self.alloc_device_buffer(req)
             self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
-            finish_count -= 1
-            ready_reqs.append(req)
+        return ready_reqs
+
+    def collect_host_ready_reqs(self) -> List[Req]:
+        """Finish staging while retaining only host KV and logical slots.
+
+        Static prefill waves must release their hot KV before the next wave.
+        The caller must invoke ``admit_request_direct`` for every returned
+        request after all waves finish and before constructing the decode batch.
+        """
+        ready_reqs = self._pop_finished_staging_reqs()
+        for req in ready_reqs:
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : req.kv.kv_allocated_len
+            ]
+            # Let the allocator translate and clear mappings, including its
+            # page/compression ownership rules. Host pages remain allocated.
+            self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
+            req.hisparse_staging = False
         return ready_reqs
 
     def map_last_loc_to_buffer(
