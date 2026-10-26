@@ -118,7 +118,7 @@ from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
@@ -623,8 +623,22 @@ class TreeCacheNamespace(SimpleNamespace):
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
 
-    def evict(self, params: EvictParams):
-        pass
+    def evict(self, params: EvictParams) -> EvictResult:
+        # All KV belongs to live benchmark requests; no prefix is reclaimable.
+        return EvictResult()
+
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        return self.evict(params)
+
+    def evictable_size(self) -> int:
+        return 0
+
+    def available_and_evictable_str(self) -> str:
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        return f"Available tokens: {available_size} ({available_size=}, evictable_size=0)"
+
+    def pretty_print(self):
+        return self.available_and_evictable_str()
 
 
 @torch.no_grad

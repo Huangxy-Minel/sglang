@@ -6,15 +6,18 @@ are compiled unchanged (except decorators) and exercised through their APIs.
 
 import ast
 import contextlib
+import dataclasses
 import inspect
 import runpy
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 BENCH = ROOT / "python/sglang/benchmark/one_batch.py"
 RUNNER = ROOT / "python/sglang/srt/model_executor/model_runner.py"
+CACHE_ROOT = ROOT / "python/sglang/srt/mem_cache"
 
 
 def load_function(path, name, env, class_name=None):
@@ -30,6 +33,25 @@ def load_function(path, name, env, class_name=None):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
     )
     node.decorator_list = []
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            node,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), env)
+    return env[name]
+
+
+def load_class(path, name, env):
+    node = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == name
+    )
     module = ast.Module(
         body=[
             ast.ImportFrom(
@@ -515,6 +537,183 @@ class TestAllocationAndFailureContracts(unittest.TestCase):
         fn = load_function(BENCH, "extend", env)
         self.assertEqual(fn([], runner, sample=False), (None, "logits", batch))
         self.assertEqual(events, ["prepare", "h2d"])
+
+
+class TestStaticBatchCacheEviction(unittest.TestCase):
+    """Keep the real allocation/eviction path; replace only GPU page storage."""
+
+    @staticmethod
+    def make_runtime(free_tokens, shard_size=1):
+        params_env = {"dataclasses": dataclasses, "__name__": __name__}
+        for name in ("EvictParams", "EvictResult"):
+            load_class(CACHE_ROOT / "base_prefix_cache.py", name, params_env)
+        cache_type = load_class(
+            BENCH,
+            "TreeCacheNamespace",
+            {
+                "SimpleNamespace": NS,
+                "EvictParams": params_env["EvictParams"],
+                "EvictResult": params_env["EvictResult"],
+            },
+        )
+        common_env = {
+            "EvictParams": params_env["EvictParams"],
+            "page_interleave_shard_size": lambda allocator: allocator.shard_size,
+        }
+        for name in (
+            "evict_from_tree_cache",
+            "_evict_until_allocatable",
+            "available_and_evictable_str",
+        ):
+            load_function(CACHE_ROOT / "common.py", name, common_env)
+        eviction = load_function(
+            CACHE_ROOT / "allocator/base.py",
+            "evict_to_free_tokens",
+            {},
+            "BaseTokenToKVPoolAllocator",
+        )
+
+        class PageAllocator:
+            page_size = 64
+            evict_to_free_tokens = eviction
+
+            def __init__(self):
+                self.free_tokens = free_tokens
+                self.shard_size = shard_size
+                self.page_allocations = []
+
+            def available_size(self):
+                return self.free_tokens
+
+            def alloc_decode(self, seq_lens, seq_lens_cpu, last_loc):
+                # A decode needs a new page only when its previous page is full.
+                pages = sum(length % 64 == 1 for length in seq_lens_cpu)
+                if pages * 64 > self.free_tokens:
+                    return None
+                self.free_tokens -= pages * 64
+                self.page_allocations.append(pages)
+                return list(range(len(seq_lens)))
+
+        allocator = PageAllocator()
+        cache = cache_type(
+            page_size=64,
+            device="cpu",
+            token_to_kv_pool_allocator=allocator,
+        )
+        decode = load_function(
+            CACHE_ROOT / "allocation.py",
+            "alloc_paged_token_slots_decode",
+            {
+                "evict_from_tree_cache": common_env["evict_from_tree_cache"],
+                "available_and_evictable_str": common_env[
+                    "available_and_evictable_str"
+                ],
+                "logger": NS(error=lambda message: None),
+            },
+        )
+        lazy_imports = {
+            "sglang.srt.mem_cache.base_prefix_cache": NS(
+                EvictParams=params_env["EvictParams"]
+            ),
+            "sglang.srt.mem_cache.common": NS(
+                _evict_until_allocatable=common_env["_evict_until_allocatable"]
+            ),
+        }
+        return NS(
+            allocator=allocator,
+            cache=cache,
+            decode=decode,
+            evict_until_allocatable=common_env["_evict_until_allocatable"],
+            params=params_env["EvictParams"],
+            result_type=params_env["EvictResult"],
+            lazy_imports=lazy_imports,
+        )
+
+    def test_noop_eviction_reports_zero_and_keeps_live_request_capacity(self):
+        runtime = self.make_runtime(free_tokens=64)
+        for method in ("evict", "evict_for_alloc"):
+            with self.subTest(method=method):
+                result = getattr(runtime.cache, method)(
+                    runtime.params(num_tokens=128, swa_num_tokens=64, mamba_num=1)
+                )
+                self.assertIsInstance(result, runtime.result_type)
+                self.assertEqual(
+                    dataclasses.asdict(result),
+                    {
+                        "num_tokens_evicted": 0,
+                        "swa_num_tokens_evicted": 0,
+                        "mamba_num_evicted": 0,
+                    },
+                )
+                self.assertEqual(runtime.allocator.available_size(), 64)
+
+    def test_decode_inside_existing_pages_succeeds_with_no_free_pages(self):
+        runtime = self.make_runtime(free_tokens=0)
+        with mock.patch.dict("sys.modules", runtime.lazy_imports):
+            runtime.decode(runtime.cache, [8194] * 4, [8194] * 4, [0] * 4)
+        self.assertEqual(runtime.allocator.page_allocations, [0])
+        self.assertEqual(runtime.allocator.available_size(), 0)
+
+    def test_sharded_eviction_stops_when_static_cache_cannot_free_pages(self):
+        runtime = self.make_runtime(free_tokens=0, shard_size=2)
+        runtime.evict_until_allocatable(runtime.cache, runtime.allocator, 64)
+        self.assertEqual(runtime.allocator.available_size(), 0)
+
+    def test_real_decode_oom_retains_capacity_diagnostic(self):
+        runtime = self.make_runtime(free_tokens=0)
+        with (
+            mock.patch.dict("sys.modules", runtime.lazy_imports),
+            self.assertRaisesRegex(
+                RuntimeError, r"Decode out of memory[\s\S]*Available tokens: 0"
+            ),
+        ):
+            runtime.decode(runtime.cache, [8193] * 4, [8193] * 4, [0] * 4)
+        self.assertEqual(runtime.allocator.available_size(), 0)
+
+    def test_admitted_full_and_partial_batches_finish_127_decode_steps(self):
+        helpers = runpy.run_path(str(BENCH.with_name("one_batch_utils.py")))
+        for total, expected_batch, expected_remaining in (
+            (4259840, 512, 0),
+            (3000000, 360, 4800),
+            (2568448, 308, 5888),
+        ):
+            with self.subTest(total=total):
+                runtime = self.make_runtime(free_tokens=total)
+                admitted = 0
+                while admitted < 512:
+                    decision = helpers["evaluate_device_wave_admission"](
+                        snapshot=helpers["DeviceCapacitySnapshot"](
+                            device_total=total,
+                            device_available=runtime.allocator.available_size(),
+                            request_slots_available=512 - admitted,
+                            max_context_len=32768,
+                        ),
+                        ready_count=admitted,
+                        requested_batch_size=512,
+                        input_len=8192,
+                        output_len=128,
+                        page_size=64,
+                    )
+                    if not decision.can_admit:
+                        self.assertEqual(decision.stop_reason, "device_pool")
+                        break
+                    # Each independently prefetched input occupies 128 pages.
+                    runtime.allocator.free_tokens -= 8192
+                    admitted += 1
+                self.assertEqual(admitted, expected_batch)
+                with mock.patch.dict("sys.modules", runtime.lazy_imports):
+                    for step in range(127):
+                        lengths = [8193 + step] * admitted
+                        runtime.decode(runtime.cache, lengths, lengths, [0] * admitted)
+                self.assertEqual(
+                    [
+                        (step, pages)
+                        for step, pages in enumerate(runtime.allocator.page_allocations)
+                        if pages
+                    ],
+                    [(0, expected_batch), (64, expected_batch)],
+                )
+                self.assertEqual(runtime.allocator.available_size(), expected_remaining)
 
 
 class TestForwardWrapper(unittest.TestCase):
